@@ -133,6 +133,8 @@ let lspProcess: ChildProcess;
 let lspParser: MessageParser;
 let lspInitialized = false;
 let serverCapabilities: unknown = null;
+/** Messages received from LSP server before initialization completes */
+const pendingServerMessages: JsonRpcMessage[] = [];
 
 // ── Spawn LSP Server ───────────────────────────────────────────────────────
 
@@ -243,8 +245,8 @@ async function initializeLsp(): Promise<void> {
       params: initParams,
     };
 
-    // Temporarily intercept the response
-    const initHandler = (msg: JsonRpcMessage) => {
+    // Handler for messages during init — looks for our init response
+    const processMessage = (msg: JsonRpcMessage) => {
       if (msg.id === requestId && !msg.method) {
         // Got initialize response
         serverCapabilities = (msg.result as any)?.capabilities;
@@ -257,24 +259,33 @@ async function initializeLsp(): Promise<void> {
           params: {},
         }));
 
+        // Drain any remaining queued messages
+        while (pendingServerMessages.length > 0) {
+          const queued = pendingServerMessages.shift()!;
+          serverToClients(queued);
+        }
+
         log(`LSP server initialized (${languageId})`);
         resolve();
-      } else {
-        // Not our response — route normally
-        serverToClients(msg);
       }
+      // Other messages during init are queued by the parser callback in main()
     };
 
-    // Swap the parser callback temporarily
+    // Process any messages already queued before we sent the init request
+    while (pendingServerMessages.length > 0) {
+      processMessage(pendingServerMessages.shift()!);
+      if (lspInitialized) return;
+    }
+
+    // Override parser to use our init handler for new messages
     lspParser = new MessageParser((msg) => {
       if (!lspInitialized) {
-        initHandler(msg);
+        processMessage(msg);
       } else {
         serverToClients(msg);
       }
     });
 
-    lspProcess.stdout!.on("data", (data) => lspParser.feed(data));
     lspProcess.stdin!.write(encodeMessage(initRequest));
 
     // Timeout
@@ -418,6 +429,18 @@ async function main() {
   log(`Starting daemon: ${lspCommand} ${lspArgs.join(" ")} (${languageId})`);
 
   lspProcess = spawnLspServer();
+
+  // Set up stdout listener immediately to avoid losing data before init
+  lspParser = new MessageParser((msg) => {
+    if (!lspInitialized) {
+      // Queue messages during initialization — initializeLsp will handle them
+      pendingServerMessages.push(msg);
+    } else {
+      serverToClients(msg);
+    }
+  });
+  lspProcess.stdout!.on("data", (data) => lspParser.feed(data));
+
   server = startSocketServer();
 
   try {
