@@ -277,9 +277,9 @@ export class LspManager {
 
         const daemonSocket = this.getSocketPath(languageId)!;
 
-        // Retry connection a few times (daemon may still be initializing)
+        // Retry connection (daemon may still be initializing jdtls which can take minutes)
         let lastErr: Error | null = null;
-        for (let attempt = 0; attempt < 10; attempt++) {
+        for (let attempt = 0; attempt < 60; attempt++) {
           try {
             const client = new LspClient({
               command: config.command,
@@ -295,7 +295,11 @@ export class LspManager {
             return client;
           } catch (err: any) {
             lastErr = err;
-            await new Promise((r) => setTimeout(r, 2000));
+            // Check if daemon is still alive before retrying
+            if (!this.isDaemonAlive(languageId)) {
+              throw new Error(`Daemon for ${languageId} died during startup: ${err.message}`);
+            }
+            await new Promise((r) => setTimeout(r, 5000));
           }
         }
         throw lastErr ?? new Error("Failed to connect to daemon");

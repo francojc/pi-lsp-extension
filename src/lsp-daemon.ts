@@ -289,9 +289,9 @@ async function initializeLsp(): Promise<void> {
     // Timeout
     setTimeout(() => {
       if (!lspInitialized) {
-        reject(new Error("LSP initialize timed out after 60s"));
+        reject(new Error("LSP initialize timed out after 5 minutes"));
       }
-    }, 60_000);
+    }, 5 * 60_000);
   });
 }
 
