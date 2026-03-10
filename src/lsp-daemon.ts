@@ -244,7 +244,6 @@ async function initializeLsp(): Promise<void> {
     };
 
     // Temporarily intercept the response
-    const originalHandler = serverToClients;
     const initHandler = (msg: JsonRpcMessage) => {
       if (msg.id === requestId && !msg.method) {
         // Got initialize response
