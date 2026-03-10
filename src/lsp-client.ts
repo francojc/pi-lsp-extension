@@ -124,6 +124,17 @@ export class LspClient {
           }
         );
 
+        // Handle connection-level errors to prevent unhandled exceptions
+        this.connection.onError(([err]) => {
+          console.error(`[LSP ${this.languageId}] Connection error: ${err.message}`);
+        });
+
+        this.connection.onClose(() => {
+          if (!this._disposed) {
+            this._initialized = false;
+          }
+        });
+
         this.connection.listen();
         this._initialized = true;
         settle(() => resolve());
@@ -167,18 +178,55 @@ export class LspClient {
       throw new Error(`Failed to spawn LSP server: ${this.options.command}`);
     }
 
+    // Wait for the process to successfully spawn before setting up the connection.
+    // spawn() is async — ENOENT and other errors arrive on the 'error' event.
+    // If we don't wait, we'll try to write to a destroyed stdin and crash.
+    await new Promise<void>((resolve, reject) => {
+      const onSpawn = () => { cleanup(); resolve(); };
+      const onError = (err: Error) => {
+        cleanup();
+        reject(new Error(`Failed to spawn LSP server "${this.options.command}": ${err.message}`));
+      };
+      const cleanup = () => {
+        this.process?.removeListener("spawn", onSpawn);
+        this.process?.removeListener("error", onError);
+      };
+      this.process!.on("spawn", onSpawn);
+      this.process!.on("error", onError);
+    });
+
     // Discard stderr to prevent blocking
     this.process.stderr?.resume();
+
+    // Patch stdin.write to silently drop writes when the stream is destroyed.
+    // StreamMessageWriter wraps stdin and calls write() which returns a Promise.
+    // If the stream is destroyed (process exited), write() throws ERR_STREAM_DESTROYED
+    // inside the Promise constructor, creating a rejection that propagates through
+    // the writer's semaphore and becomes unhandled (notifications are fire-and-forget).
+    // No amount of error handlers on the stream or connection can catch this.
+    const stdin = this.process.stdin!;
+    const originalWrite = stdin.write;
+    stdin.write = function (this: typeof stdin, ...args: any[]): boolean {
+      if (this.destroyed) {
+        // Call the callback (last arg) so the Promise resolves instead of rejecting
+        const cb = args[args.length - 1];
+        if (typeof cb === "function") process.nextTick(cb);
+        return false;
+      }
+      return originalWrite.apply(this, args as any);
+    } as any;
 
     this.process.on("error", (err) => {
       console.error(`[LSP ${this.languageId}] Process error: ${err.message}`);
       this._initialized = false;
+      this.disposeConnection();
     });
 
     this.process.on("exit", (code) => {
       if (!this._disposed) {
         console.error(`[LSP ${this.languageId}] Server exited with code ${code}`);
         this._initialized = false;
+        this.disposeConnection();
       }
     });
 
@@ -193,6 +241,17 @@ export class LspClient {
         this._diagnostics.set(params.uri, params.diagnostics);
       }
     );
+
+    // Handle connection-level errors to prevent unhandled exceptions
+    this.connection.onError(([err]) => {
+      console.error(`[LSP ${this.languageId}] Connection error: ${err.message}`);
+    });
+
+    this.connection.onClose(() => {
+      if (!this._disposed) {
+        this._initialized = false;
+      }
+    });
 
     this.connection.listen();
 
@@ -253,6 +312,18 @@ export class LspClient {
     this._initialized = true;
   }
 
+  /** Safely dispose the connection without throwing */
+  private disposeConnection(): void {
+    try {
+      if (this.connection) {
+        this.connection.dispose();
+      }
+    } catch {
+      // Already disposed or stream destroyed — ignore
+    }
+    this.connection = null;
+  }
+
   /** Send a request to the LSP server */
   async sendRequest<R>(method: string, params: unknown): Promise<R> {
     if (!this.connection || !this._initialized) {
@@ -297,13 +368,10 @@ export class LspClient {
 
     if (this._isDaemonClient) {
       // Socket client: just disconnect — daemon keeps the server alive
-      try {
-        if (this.connection) this.connection.dispose();
-      } catch { /* ignore */ }
+      this.disposeConnection();
       if (this.socket) {
         this.socket.destroy();
       }
-      this.connection = null;
       this.socket = null;
       return;
     }
@@ -311,16 +379,20 @@ export class LspClient {
     // Direct mode: shut down the server we own
     try {
       if (this.connection) {
+        // Race shutdown request against a timeout. Catch the request separately
+        // so if the timeout wins, the abandoned sendRequest rejection doesn't
+        // become an unhandled promise rejection.
+        const shutdownReq = this.connection.sendRequest("shutdown").catch(() => {});
         await Promise.race([
-          this.connection.sendRequest("shutdown"),
+          shutdownReq,
           new Promise((resolve) => setTimeout(resolve, 3000)),
         ]);
-        this.connection.sendNotification("exit");
-        this.connection.dispose();
+        try { this.connection.sendNotification("exit"); } catch {}
       }
     } catch {
       // Server may already be dead
     }
+    this.disposeConnection();
 
     if (this.process) {
       this.process.kill("SIGTERM");
@@ -332,7 +404,6 @@ export class LspClient {
       }, 2000);
     }
 
-    this.connection = null;
     this.process = null;
   }
 }
