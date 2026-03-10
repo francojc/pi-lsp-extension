@@ -336,7 +336,7 @@ export class LspManager {
     workspaceFolders?: { uri: string; name: string }[],
   ): Promise<void> {
     const socketPath = this.getSocketPath(languageId)!;
-    const daemonScript = new URL("./lsp-daemon.js", import.meta.url).pathname;
+    const daemonScript = new URL("./lsp-daemon.ts", import.meta.url).pathname;
 
     const env: Record<string, string> = {
       ...process.env as Record<string, string>,
