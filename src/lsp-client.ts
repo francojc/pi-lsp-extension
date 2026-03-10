@@ -1,16 +1,23 @@
 /**
- * LSP Client — lightweight JSON-RPC client over stdio for LSP servers.
+ * LSP Client — JSON-RPC client for LSP servers.
  *
- * Uses vscode-jsonrpc (bundled with vscode-languageserver-protocol) to
- * communicate with any Language Server Protocol server spawned as a child process.
+ * Supports two modes:
+ * - **Direct**: spawns LSP server as child process (stdio)
+ * - **Socket**: connects to an LSP daemon via Unix domain socket
+ *
+ * Uses vscode-jsonrpc (bundled with vscode-languageserver-protocol) for
+ * JSON-RPC message framing and transport.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { connect as netConnect, type Socket } from "node:net";
 import { pathToFileURL } from "node:url";
 import {
   createMessageConnection,
   StreamMessageReader,
   StreamMessageWriter,
+  SocketMessageReader,
+  SocketMessageWriter,
   type MessageConnection,
 } from "vscode-languageserver-protocol/node.js";
 import type {
@@ -34,15 +41,20 @@ export interface LspClientOptions {
   env?: Record<string, string>;
   /** Additional workspace folders (e.g. from bemol for Brazil multi-package workspaces) */
   workspaceFolders?: { uri: string; name: string }[];
+  /** Connect to existing daemon socket instead of spawning a new process */
+  socketPath?: string;
 }
 
 export class LspClient {
   private process: ChildProcess | null = null;
+  private socket: Socket | null = null;
   private connection: MessageConnection | null = null;
   private _serverCapabilities: ServerCapabilities | null = null;
   private _diagnostics: Map<string, Diagnostic[]> = new Map();
   private _initialized = false;
   private _disposed = false;
+  /** True if connected to a daemon socket (server init handled by daemon) */
+  private _isDaemonClient = false;
 
   readonly languageId: string;
   readonly command: string;
@@ -80,6 +92,64 @@ export class LspClient {
   async start(): Promise<void> {
     if (this._initialized || this._disposed) return;
 
+    if (this.options.socketPath) {
+      await this.connectToSocket(this.options.socketPath);
+    } else {
+      await this.spawnDirect();
+    }
+  }
+
+  /** Connect to an existing LSP daemon via Unix socket (no init handshake needed) */
+  private async connectToSocket(socketPath: string): Promise<void> {
+    this._isDaemonClient = true;
+
+    return new Promise((resolve, reject) => {
+      const socket = netConnect(socketPath, () => {
+        this.socket = socket;
+
+        const reader = new SocketMessageReader(socket);
+        const writer = new SocketMessageWriter(socket);
+        this.connection = createMessageConnection(reader, writer);
+
+        // Listen for diagnostics
+        this.connection.onNotification(
+          "textDocument/publishDiagnostics",
+          (params: PublishDiagnosticsParams) => {
+            this._diagnostics.set(params.uri, params.diagnostics);
+          }
+        );
+
+        this.connection.listen();
+        this._initialized = true;
+        resolve();
+      });
+
+      socket.on("error", (err) => {
+        if (!this._initialized) {
+          reject(new Error(`Failed to connect to LSP daemon: ${err.message}`));
+        } else {
+          this._initialized = false;
+        }
+      });
+
+      socket.on("close", () => {
+        if (!this._disposed) {
+          this._initialized = false;
+        }
+      });
+
+      // Timeout
+      setTimeout(() => {
+        if (!this._initialized) {
+          socket.destroy();
+          reject(new Error("Timeout connecting to LSP daemon socket"));
+        }
+      }, 10_000);
+    });
+  }
+
+  /** Spawn LSP server directly as child process with stdio */
+  private async spawnDirect(): Promise<void> {
     const env = { ...process.env, ...this.options.env };
 
     this.process = spawn(this.options.command, this.options.args, {
@@ -111,7 +181,7 @@ export class LspClient {
     const writer = new StreamMessageWriter(this.process.stdin);
     this.connection = createMessageConnection(reader, writer);
 
-    // Listen for published diagnostics (using string method to avoid type conflicts)
+    // Listen for published diagnostics
     this.connection.onNotification(
       "textDocument/publishDiagnostics",
       (params: PublishDiagnosticsParams) => {
@@ -214,12 +284,26 @@ export class LspClient {
     });
   }
 
-  /** Gracefully shut down the server */
+  /** Gracefully shut down or disconnect from the server */
   async shutdown(): Promise<void> {
     if (this._disposed) return;
     this._disposed = true;
     this._initialized = false;
 
+    if (this._isDaemonClient) {
+      // Socket client: just disconnect — daemon keeps the server alive
+      try {
+        if (this.connection) this.connection.dispose();
+      } catch { /* ignore */ }
+      if (this.socket) {
+        this.socket.destroy();
+      }
+      this.connection = null;
+      this.socket = null;
+      return;
+    }
+
+    // Direct mode: shut down the server we own
     try {
       if (this.connection) {
         await Promise.race([

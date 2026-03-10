@@ -5,11 +5,12 @@
  * Integrates with bemol for Brazil workspace support.
  */
 
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { existsSync, readFileSync } from "node:fs";
+import { spawn as spawnChild } from "node:child_process";
 import { LspClient, type LspClientOptions } from "./lsp-client.js";
 import { BemolManager } from "./bemol.js";
-import { acquireLock, releaseLock, isLockedByOther, releaseAllLocks } from "./locks.js";
 
 export interface ServerConfig {
   command: string;
@@ -74,8 +75,8 @@ export interface ServerStatus {
   command: string;
   running: boolean;
   diagnosticsCount: number;
-  /** True if another pi session owns the LSP lock for this language */
-  lockedOut: boolean;
+  /** True if using a shared daemon (vs direct spawn) */
+  shared: boolean;
 }
 
 export class LspManager {
@@ -88,8 +89,6 @@ export class LspManager {
   private _bemolEnsuring: Promise<boolean> | null = null;
   private _callbacks: LspManagerCallbacks;
   private _sessionId: string;
-  /** Languages where another session holds the LSP lock */
-  private _lockedOut: Set<string> = new Set();
 
   constructor(rootDir: string, customConfigs?: Record<string, ServerConfig>, callbacks?: LspManagerCallbacks, sessionId?: string) {
     this.rootDir = resolve(rootDir);
@@ -158,8 +157,8 @@ export class LspManager {
 
   /**
    * Get the LSP client for a language, starting the server if needed.
-   * Returns null if no server is configured for this language or if
-   * another session owns the LSP lock for this language.
+   * In Brazil workspaces, connects to a shared daemon (or spawns one).
+   * Returns null if no server is configured for this language.
    */
   async getClientForLanguage(languageId: string): Promise<LspClient | null> {
     // Already running?
@@ -172,21 +171,10 @@ export class LspManager {
     const starting = this.startingServers.get(languageId);
     if (starting) return starting;
 
-    // Locked out by another session?
-    if (this._lockedOut.has(languageId)) return null;
-
     const config = this.serverConfigs.get(languageId);
     if (!config) return null;
 
-    // Check if another session holds the lock for this language
-    const wsRoot = this._bemol.workspaceRoot;
-    if (wsRoot && isLockedByOther(wsRoot, `lsp-${languageId}`)) {
-      this._lockedOut.add(languageId);
-      this._callbacks.onServerError?.(languageId, `LSP server for ${languageId} is owned by another pi session`);
-      return null;
-    }
-
-    // Start a new server
+    // Start a new server (or connect to daemon)
     const startPromise = this.startServer(languageId, config);
     this.startingServers.set(languageId, startPromise);
 
@@ -226,25 +214,75 @@ export class LspManager {
     // Run bemol if in a Brazil workspace (one-time)
     await this.ensureBemol();
 
-    // Acquire LSP lock for this language
     const wsRoot = this._bemol.workspaceRoot;
-    if (wsRoot) {
-      const acquired = acquireLock(wsRoot, `lsp-${languageId}`, this._sessionId);
-      if (!acquired) {
-        this._lockedOut.add(languageId);
-        const message = `LSP server for ${languageId} is owned by another pi session`;
-        this._callbacks.onServerError?.(languageId, message);
-        throw new Error(message);
-      }
-    }
-
-    // Get workspace folders from bemol if available
     const workspaceFolders = this._bemol.isBrazilWorkspace
       ? this._bemol.getWorkspaceFolders()
       : undefined;
 
+    // Try connecting to an existing daemon socket first
+    const socketPath = this.getSocketPath(languageId);
+    if (socketPath && this.isDaemonAlive(languageId)) {
+      this._callbacks.onServerStart?.(languageId, `${config.command} (shared)`);
+      try {
+        const client = new LspClient({
+          command: config.command,
+          args: config.args,
+          rootDir: this.rootDir,
+          languageId,
+          socketPath,
+        });
+        await client.start();
+        this.clients.set(languageId, client);
+        this.startingServers.delete(languageId);
+        this._callbacks.onServerReady?.(languageId);
+        return client;
+      } catch {
+        // Daemon may be stale — fall through to spawn new one
+      }
+    }
+
+    // No existing daemon — spawn one (or start direct if no workspace root)
     this._callbacks.onServerStart?.(languageId, config.command);
 
+    if (wsRoot) {
+      // Spawn daemon and connect via socket
+      try {
+        await this.spawnDaemon(languageId, config, workspaceFolders);
+        // Small delay to let daemon start listening
+        await new Promise((r) => setTimeout(r, 500));
+
+        const daemonSocket = this.getSocketPath(languageId)!;
+        const client = new LspClient({
+          command: config.command,
+          args: config.args,
+          rootDir: this.rootDir,
+          languageId,
+          socketPath: daemonSocket,
+        });
+
+        // Retry connection a few times (daemon may still be initializing)
+        let lastErr: Error | null = null;
+        for (let attempt = 0; attempt < 10; attempt++) {
+          try {
+            await client.start();
+            this.clients.set(languageId, client);
+            this.startingServers.delete(languageId);
+            this._callbacks.onServerReady?.(languageId);
+            return client;
+          } catch (err: any) {
+            lastErr = err;
+            await new Promise((r) => setTimeout(r, 2000));
+          }
+        }
+        throw lastErr ?? new Error("Failed to connect to daemon");
+      } catch (err: any) {
+        // Fall back to direct mode
+        this.startingServers.delete(languageId);
+        // Don't throw — try direct mode below
+      }
+    }
+
+    // Direct mode (no workspace root, or daemon failed)
     const client = new LspClient({
       command: config.command,
       args: config.args,
@@ -262,12 +300,67 @@ export class LspManager {
       return client;
     } catch (err: any) {
       this.startingServers.delete(languageId);
-      // Release lock on failure
-      if (wsRoot) releaseLock(wsRoot, `lsp-${languageId}`);
       const message = `Failed to start LSP server for ${languageId} (${config.command}): ${err.message}`;
       this._callbacks.onServerError?.(languageId, message);
       throw new Error(message);
     }
+  }
+
+  /** Get the socket path for a language's daemon */
+  private getSocketPath(languageId: string): string | null {
+    const wsRoot = this._bemol.workspaceRoot;
+    if (!wsRoot) return null;
+    return join(wsRoot, ".bemol", "sockets", `lsp-${languageId}.sock`);
+  }
+
+  /** Check if a daemon is alive for this language */
+  private isDaemonAlive(languageId: string): boolean {
+    const wsRoot = this._bemol.workspaceRoot;
+    if (!wsRoot) return false;
+    const pidPath = join(wsRoot, ".bemol", "sockets", `lsp-${languageId}.pid`);
+    try {
+      if (!existsSync(pidPath)) return false;
+      const pid = parseInt(readFileSync(pidPath, "utf-8").trim(), 10);
+      if (isNaN(pid)) return false;
+      process.kill(pid, 0); // throws if not alive
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Spawn an LSP daemon as a detached background process */
+  private async spawnDaemon(
+    languageId: string,
+    config: ServerConfig,
+    workspaceFolders?: { uri: string; name: string }[],
+  ): Promise<void> {
+    const socketPath = this.getSocketPath(languageId)!;
+    const daemonScript = new URL("./lsp-daemon.js", import.meta.url).pathname;
+
+    const env: Record<string, string> = {
+      ...process.env as Record<string, string>,
+      ...(config.env ?? {}),
+      LSP_ROOT_DIR: this.rootDir,
+      LSP_LANGUAGE_ID: languageId,
+    };
+
+    if (workspaceFolders && workspaceFolders.length > 0) {
+      env.LSP_WORKSPACE_FOLDERS = JSON.stringify(workspaceFolders);
+    }
+
+    const child = spawnChild(
+      process.execPath, // node
+      ["--import", "jiti/register", daemonScript, socketPath, config.command, ...config.args],
+      {
+        cwd: this.rootDir,
+        env,
+        detached: true,
+        stdio: "ignore",
+      },
+    );
+
+    child.unref(); // let daemon outlive this process
   }
 
   /** Get status of all configured/running servers */
@@ -281,19 +374,19 @@ export class LspManager {
           diagnosticsCount += diags.length;
         }
       }
-      const lockedOut = this._lockedOut.has(languageId);
+      const daemonAlive = this.isDaemonAlive(languageId);
       statuses.push({
         languageId,
         command: config.command,
         running: client?.initialized === true && !client.disposed,
         diagnosticsCount,
-        lockedOut,
+        shared: daemonAlive,
       });
     }
     return statuses;
   }
 
-  /** Shut down all running servers, release locks, and stop bemol watch */
+  /** Shut down all clients (disconnect from daemons, kill direct servers) */
   async shutdownAll(): Promise<void> {
     this._bemol.shutdown();
     const shutdowns = [...this.clients.values()].map((client) =>
@@ -302,9 +395,5 @@ export class LspManager {
     await Promise.all(shutdowns);
     this.clients.clear();
     this.startingServers.clear();
-
-    // Release all LSP locks owned by this session
-    const wsRoot = this._bemol.workspaceRoot;
-    if (wsRoot) releaseAllLocks(wsRoot);
   }
 }
