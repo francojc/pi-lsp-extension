@@ -52,7 +52,7 @@ export function createDefinitionTool(manager: LspManager): ToolDefinition<typeof
       const filePath = params.path.replace(/^@/, "");
       const client = await manager.getClientForFile(filePath).catch(() => null);
       if (!client) {
-        return { content: [{ type: "text", text: `No LSP server available for: ${filePath}` }], details: { count: 0 } } as any;
+        return { content: [{ type: "text", text: manager.getUnavailableReason(filePath) }], details: { count: 0 } } as any;
       }
 
       const uri = manager.getFileUri(filePath);

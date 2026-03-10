@@ -55,15 +55,8 @@ export function createDiagnosticsTool(manager: LspManager): ToolDefinition<typeo
       const client = await manager.getClientForFile(filePath).catch(() => null);
 
       if (!client) {
-        const lang = manager.getLanguageId(filePath);
-        if (!lang) {
-          return {
-            content: [{ type: "text", text: `No LSP server configured for file type: ${filePath}` }],
-            details: { count: 0 },
-          };
-        }
         return {
-          content: [{ type: "text", text: `LSP server for ${lang} is not available. Is the server installed?` }],
+          content: [{ type: "text", text: manager.getUnavailableReason(filePath) }],
           details: { count: 0 },
         } as any;
       }

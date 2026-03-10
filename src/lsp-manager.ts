@@ -156,6 +156,22 @@ export class LspManager {
   }
 
   /**
+   * Get a user-friendly message about why no client is available for a file.
+   */
+  getUnavailableReason(filePath: string): string {
+    const languageId = this.getLanguageId(filePath);
+    if (!languageId) return `No LSP server configured for file type: ${filePath}`;
+    if (this.startingServers.has(languageId)) {
+      return `LSP server for ${languageId} is still starting up. Try again in a moment.`;
+    }
+    const existing = this.clients.get(languageId);
+    if (existing && !existing.initialized && !existing.disposed) {
+      return `LSP server for ${languageId} is initializing. Try again in a moment.`;
+    }
+    return `No LSP server available for: ${filePath}`;
+  }
+
+  /**
    * Get the LSP client for a language, starting the server if needed.
    * In Brazil workspaces, connects to a shared daemon (or spawns one).
    * Returns null if no server is configured for this language.
@@ -167,24 +183,32 @@ export class LspManager {
       return existing;
     }
 
-    // Already starting?
+    // Already starting? Don't block — return null so tools can show "starting" message
     const starting = this.startingServers.get(languageId);
-    if (starting) return starting;
+    if (starting) return null;
 
     const config = this.serverConfigs.get(languageId);
     if (!config) return null;
 
-    // Start a new server (or connect to daemon)
+    // Kick off server start in the background — don't await
     const startPromise = this.startServer(languageId, config);
     this.startingServers.set(languageId, startPromise);
 
-    try {
-      const client = await startPromise;
-      return client;
-    } catch (err) {
+    // Fire-and-forget: clean up on completion or failure
+    startPromise.catch((err) => {
       this.startingServers.delete(languageId);
-      throw err;
-    }
+      const message = `Failed to start LSP server for ${languageId}: ${err.message}`;
+      this._callbacks.onServerError?.(languageId, message);
+    });
+
+    return null; // Server not ready yet
+  }
+
+  /**
+   * Check if a server is currently starting up for a language.
+   */
+  isServerStarting(languageId: string): boolean {
+    return this.startingServers.has(languageId);
   }
 
   /**
@@ -338,6 +362,19 @@ export class LspManager {
   ): Promise<void> {
     const socketPath = this.getSocketPath(languageId)!;
     const daemonScript = new URL("./lsp-daemon.ts", import.meta.url).pathname;
+    const launcherScript = new URL("./lsp-daemon-launcher.cjs", import.meta.url).pathname;
+
+    // Resolve jiti from the running process's module context
+    let jitiPath: string;
+    try {
+      jitiPath = require.resolve("@mariozechner/jiti");
+    } catch {
+      try {
+        jitiPath = require.resolve("jiti");
+      } catch {
+        throw new Error("Cannot resolve jiti for daemon spawn — jiti not found in module path");
+      }
+    }
 
     const env: Record<string, string> = {
       ...process.env as Record<string, string>,
@@ -352,7 +389,7 @@ export class LspManager {
 
     const child = spawnChild(
       process.execPath, // node
-      ["--import", "jiti/register", daemonScript, socketPath, config.command, ...config.args],
+      [launcherScript, jitiPath, daemonScript, socketPath, config.command, ...config.args],
       {
         cwd: this.rootDir,
         env,

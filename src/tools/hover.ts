@@ -45,7 +45,7 @@ export function createHoverTool(manager: LspManager): ToolDefinition<typeof Hove
       const filePath = params.path.replace(/^@/, "");
       const client = await manager.getClientForFile(filePath).catch(() => null);
       if (!client) {
-        return { content: [{ type: "text", text: `No LSP server available for: ${filePath}` }], details: { hasResult: false } } as any;
+        return { content: [{ type: "text", text: manager.getUnavailableReason(filePath) }], details: { hasResult: false } } as any;
       }
 
       const uri = manager.getFileUri(filePath);

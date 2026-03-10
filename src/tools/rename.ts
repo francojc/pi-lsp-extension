@@ -72,7 +72,7 @@ export function createRenameTool(manager: LspManager): ToolDefinition<typeof Ren
       const filePath = params.path.replace(/^@/, "");
       const client = await manager.getClientForFile(filePath).catch(() => null);
       if (!client) {
-        return { content: [{ type: "text", text: `No LSP server available for: ${filePath}` }], details: { fileCount: 0, editCount: 0 } } as any;
+        return { content: [{ type: "text", text: manager.getUnavailableReason(filePath) }], details: { fileCount: 0, editCount: 0 } } as any;
       }
 
       const uri = manager.getFileUri(filePath);
