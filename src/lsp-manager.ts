@@ -252,18 +252,18 @@ export class LspManager {
         await new Promise((r) => setTimeout(r, 500));
 
         const daemonSocket = this.getSocketPath(languageId)!;
-        const client = new LspClient({
-          command: config.command,
-          args: config.args,
-          rootDir: this.rootDir,
-          languageId,
-          socketPath: daemonSocket,
-        });
 
         // Retry connection a few times (daemon may still be initializing)
         let lastErr: Error | null = null;
         for (let attempt = 0; attempt < 10; attempt++) {
           try {
+            const client = new LspClient({
+              command: config.command,
+              args: config.args,
+              rootDir: this.rootDir,
+              languageId,
+              socketPath: daemonSocket,
+            });
             await client.start();
             this.clients.set(languageId, client);
             this.startingServers.delete(languageId);
