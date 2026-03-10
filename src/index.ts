@@ -21,6 +21,7 @@ import {
   isWriteToolResult,
   isEditToolResult,
 } from "@mariozechner/pi-coding-agent";
+import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 
 import { LspManager, type ServerConfig, type LspManagerCallbacks } from "./lsp-manager.js";
 import { FileSync } from "./file-sync.js";
@@ -30,6 +31,7 @@ import { createDefinitionTool } from "./tools/definition.js";
 import { createReferencesTool } from "./tools/references.js";
 import { createSymbolsTool } from "./tools/symbols.js";
 import { createRenameTool } from "./tools/rename.js";
+import { relative } from "node:path";
 
 export default function lspExtension(pi: ExtensionAPI) {
   let manager: LspManager | null = null;
@@ -118,12 +120,12 @@ export default function lspExtension(pi: ExtensionAPI) {
   pi.registerTool(createRenameTool(managerProxy));
 
   // File sync: track file reads/writes/edits
+  // After writes/edits, append file-scoped error diagnostics to the tool result
   pi.on("tool_result", async (event) => {
     const sync = getFileSync();
 
     try {
       if (isReadToolResult(event) && !event.isError) {
-        // Extract path from input
         const path = (event.input as any)?.path;
         if (path) await sync.handleFileRead(path);
       }
@@ -139,6 +141,48 @@ export default function lspExtension(pi: ExtensionAPI) {
       }
     } catch {
       // File sync errors are non-fatal
+    }
+
+    // Auto-append diagnostics for the changed file (write/edit only)
+    if ((isWriteToolResult(event) || isEditToolResult(event)) && !event.isError && manager) {
+      const path = (event.input as any)?.path;
+      if (!path) return;
+
+      const languageId = manager.getLanguageId(path);
+      if (!languageId) return;
+
+      const client = manager.getRunningClient(languageId);
+      if (!client) return;
+
+      // Wait briefly for the LSP to publish updated diagnostics
+      await new Promise((r) => setTimeout(r, 1500));
+
+      const uri = manager.getFileUri(path);
+      const diagnostics = client.getDiagnostics(uri);
+      const errors = diagnostics.filter((d) => d.severity === DiagnosticSeverity.Error);
+
+      if (errors.length === 0) return;
+
+      // Build a compact summary — just errors, max 10 lines
+      const relPath = relative(manager.resolvePath("."), manager.resolvePath(path));
+      const lines = errors.slice(0, 10).map((d) => {
+        const line = d.range.start.line + 1;
+        const col = d.range.start.character + 1;
+        const source = d.source ? ` [${d.source}]` : "";
+        return `${relPath}:${line}:${col} error: ${d.message}${source}`;
+      });
+      if (errors.length > 10) {
+        lines.push(`... and ${errors.length - 10} more error(s)`);
+      }
+
+      const summary = `\n\n⚠ LSP: ${errors.length} error(s) in ${relPath}:\n${lines.join("\n")}`;
+
+      return {
+        content: [
+          ...event.content,
+          { type: "text" as const, text: summary },
+        ],
+      };
     }
   });
 
