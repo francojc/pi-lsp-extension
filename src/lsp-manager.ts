@@ -16,6 +16,15 @@ export interface ServerConfig {
   env?: Record<string, string>;
 }
 
+/** Lifecycle callbacks for UI notifications */
+export interface LspManagerCallbacks {
+  onBemolStart?: () => void;
+  onBemolEnd?: (success: boolean, duration: number) => void;
+  onServerStart?: (languageId: string, command: string) => void;
+  onServerReady?: (languageId: string) => void;
+  onServerError?: (languageId: string, error: string) => void;
+}
+
 /** Default server configurations for common languages */
 const DEFAULT_SERVERS: Record<string, ServerConfig> = {
   typescript: { command: "typescript-language-server", args: ["--stdio"] },
@@ -74,14 +83,16 @@ export class LspManager {
   private _bemol: BemolManager;
   private _bemolEnsured = false;
   private _bemolEnsuring: Promise<boolean> | null = null;
+  private _callbacks: LspManagerCallbacks;
 
-  constructor(rootDir: string, customConfigs?: Record<string, ServerConfig>) {
+  constructor(rootDir: string, customConfigs?: Record<string, ServerConfig>, callbacks?: LspManagerCallbacks) {
     this.rootDir = resolve(rootDir);
     this.serverConfigs = new Map(Object.entries({
       ...DEFAULT_SERVERS,
       ...customConfigs,
     }));
     this._bemol = new BemolManager(this.rootDir);
+    this._callbacks = callbacks ?? {};
   }
 
   /** Get the bemol manager for status/commands */
@@ -179,9 +190,12 @@ export class LspManager {
       await this._bemolEnsuring;
       return;
     }
+    this._callbacks.onBemolStart?.();
+    const start = Date.now();
     this._bemolEnsuring = this._bemol.ensureBemolConfig();
     try {
-      await this._bemolEnsuring;
+      const success = await this._bemolEnsuring;
+      this._callbacks.onBemolEnd?.(success, Date.now() - start);
     } finally {
       this._bemolEnsured = true;
       this._bemolEnsuring = null;
@@ -197,6 +211,8 @@ export class LspManager {
       ? this._bemol.getWorkspaceFolders()
       : undefined;
 
+    this._callbacks.onServerStart?.(languageId, config.command);
+
     const client = new LspClient({
       command: config.command,
       args: config.args,
@@ -210,12 +226,13 @@ export class LspManager {
       await client.start();
       this.clients.set(languageId, client);
       this.startingServers.delete(languageId);
+      this._callbacks.onServerReady?.(languageId);
       return client;
     } catch (err: any) {
       this.startingServers.delete(languageId);
-      throw new Error(
-        `Failed to start LSP server for ${languageId} (${config.command}): ${err.message}`
-      );
+      const message = `Failed to start LSP server for ${languageId} (${config.command}): ${err.message}`;
+      this._callbacks.onServerError?.(languageId, message);
+      throw new Error(message);
     }
   }
 

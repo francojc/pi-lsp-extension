@@ -22,7 +22,7 @@ import {
   isEditToolResult,
 } from "@mariozechner/pi-coding-agent";
 
-import { LspManager, type ServerConfig } from "./lsp-manager.js";
+import { LspManager, type ServerConfig, type LspManagerCallbacks } from "./lsp-manager.js";
 import { FileSync } from "./file-sync.js";
 import { BemolManager } from "./bemol.js";
 import { createDiagnosticsTool } from "./tools/diagnostics.js";
@@ -35,11 +35,37 @@ import { createRenameTool } from "./tools/rename.js";
 export default function lspExtension(pi: ExtensionAPI) {
   let manager: LspManager | null = null;
   let fileSync: FileSync | null = null;
+  // Store latest ctx for lifecycle callbacks (updated on each event)
+  let latestCtx: any = null;
+
+  /** Build lifecycle callbacks that update UI status */
+  const makeCallbacks = (): LspManagerCallbacks => ({
+    onBemolStart: () => {
+      latestCtx?.ui?.setStatus("lsp", latestCtx.ui.theme.fg("warning", "LSP: running bemol..."));
+    },
+    onBemolEnd: (success: boolean, duration: number) => {
+      const secs = (duration / 1000).toFixed(1);
+      if (success) {
+        latestCtx?.ui?.setStatus("lsp", latestCtx.ui.theme.fg("accent", `LSP: bemol done (${secs}s)`));
+      } else {
+        latestCtx?.ui?.setStatus("lsp", latestCtx.ui.theme.fg("warning", `LSP: bemol failed (${secs}s)`));
+      }
+    },
+    onServerStart: (languageId: string, command: string) => {
+      latestCtx?.ui?.setStatus("lsp", latestCtx.ui.theme.fg("warning", `LSP: starting ${languageId} (${command})...`));
+    },
+    onServerReady: (languageId: string) => {
+      latestCtx?.ui?.setStatus("lsp", latestCtx.ui.theme.fg("accent", `LSP: ${languageId} ready`));
+    },
+    onServerError: (languageId: string, error: string) => {
+      latestCtx?.ui?.setStatus("lsp", latestCtx.ui.theme.fg("error", `LSP: ${languageId} failed`));
+    },
+  });
 
   // Create manager eagerly so tools can reference it, but servers start lazily
   const getManager = (): LspManager => {
     if (!manager) {
-      manager = new LspManager(process.cwd());
+      manager = new LspManager(process.cwd(), undefined, makeCallbacks());
       fileSync = new FileSync(manager);
     }
     return manager;
@@ -54,7 +80,8 @@ export default function lspExtension(pi: ExtensionAPI) {
 
   // Initialize manager (uses cwd at session start time)
   pi.on("session_start", async (_event, ctx) => {
-    manager = new LspManager(ctx.cwd);
+    latestCtx = ctx;
+    manager = new LspManager(ctx.cwd, undefined, makeCallbacks());
     fileSync = new FileSync(manager);
 
     // Detect Brazil workspace and show appropriate status
@@ -118,6 +145,7 @@ export default function lspExtension(pi: ExtensionAPI) {
 
   // Update status after tool execution ends
   pi.on("tool_execution_end", async (_event, ctx) => {
+    latestCtx = ctx;
     if (!manager) return;
     const statuses = manager.getStatus();
     const running = statuses.filter((s) => s.running);
