@@ -1,5 +1,8 @@
 /**
- * lsp_diagnostics — Get compilation errors and warnings for a file.
+ * lsp_diagnostics — Get compilation errors and warnings for a file or the whole workspace.
+ *
+ * When `path` is provided: returns diagnostics for that single file.
+ * When `path` is omitted: returns all cached diagnostics across all running LSP servers.
  */
 
 import { Type } from "@sinclair/typebox";
@@ -9,6 +12,7 @@ import { truncateHead, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES } from "@mariozechne
 import { Text } from "@mariozechner/pi-tui";
 import type { LspManager } from "../lsp-manager.js";
 import { relative } from "node:path";
+import { fileURLToPath } from "node:url";
 
 function severityToString(severity: number | undefined): string {
   switch (severity) {
@@ -30,27 +34,35 @@ function formatDiagnostic(diag: Diagnostic, filePath: string): string {
 }
 
 const DiagnosticsParams = Type.Object({
-  path: Type.String({ description: "File path to get diagnostics for" }),
+  path: Type.Optional(Type.String({ description: "File path to get diagnostics for. Omit to get all workspace diagnostics from running LSP servers." })),
 });
 
 interface DiagnosticsDetails {
   count: number;
   errors?: number;
   warnings?: number;
+  files?: number;
 }
 
 export function createDiagnosticsTool(manager: LspManager): ToolDefinition<typeof DiagnosticsParams, DiagnosticsDetails> {
   return {
     name: "lsp_diagnostics",
     label: "LSP Diagnostics",
-    description: "Get compilation errors and warnings for a file from the LSP server. Returns cached diagnostics published by the language server.",
-    promptSnippet: "Get compiler errors, warnings, and hints for a source file via LSP",
+    description: "Get compilation errors and warnings from the LSP server. Pass a file path to check a single file, or omit path to get all cached diagnostics across the workspace.",
+    promptSnippet: "Get compiler errors, warnings, and hints for a source file via LSP. Omit path to get all workspace diagnostics.",
     promptGuidelines: [
       "After making code changes with edit or write, use lsp_diagnostics to check for compilation errors before moving on.",
+      "To review all workspace diagnostics at once, call lsp_diagnostics with no arguments — this returns all cached diagnostics from running LSP servers without needing to check files individually.",
     ],
     parameters: DiagnosticsParams,
 
     async execute(_toolCallId, params) {
+      // Workspace-wide mode: no path provided
+      if (!params.path) {
+        return executeWorkspaceDiagnostics(manager);
+      }
+
+      // Single-file mode
       const filePath = params.path.replace(/^@/, "");
       const client = await manager.getClientForFile(filePath).catch(() => null);
 
@@ -97,7 +109,11 @@ export function createDiagnosticsTool(manager: LspManager): ToolDefinition<typeo
 
     renderCall(args, theme) {
       let text = theme.fg("toolTitle", theme.bold("lsp_diagnostics "));
-      text += theme.fg("accent", args.path);
+      if (args.path) {
+        text += theme.fg("accent", args.path);
+      } else {
+        text += theme.fg("dim", "(workspace)");
+      }
       return new Text(text, 0, 0);
     },
 
@@ -113,6 +129,9 @@ export function createDiagnosticsTool(manager: LspManager): ToolDefinition<typeo
         if (text) text += " ";
         text += theme.fg("warning", `${details.warnings} warning(s)`);
       }
+      if (details.files && details.files > 0) {
+        text += theme.fg("dim", ` in ${details.files} file(s)`);
+      }
       if (expanded) {
         const content = result.content[0];
         if (content?.type === "text") {
@@ -122,5 +141,82 @@ export function createDiagnosticsTool(manager: LspManager): ToolDefinition<typeo
       }
       return new Text(text, 0, 0);
     },
+  };
+}
+
+/** Collect all diagnostics from all running LSP servers */
+function executeWorkspaceDiagnostics(manager: LspManager) {
+  const statuses = manager.getStatus();
+  const running = statuses.filter((s) => s.running);
+
+  if (running.length === 0) {
+    return {
+      content: [{ type: "text" as const, text: "No LSP servers are running. Use lsp_diagnostics with a file path to start a server and check that file." }],
+      details: { count: 0 },
+    };
+  }
+
+  const rootDir = manager.resolvePath(".");
+  const allDiagnostics: { relPath: string; diag: Diagnostic }[] = [];
+
+  for (const status of running) {
+    const client = manager.getRunningClient(status.languageId);
+    if (!client) continue;
+
+    const diagMap = client.getAllDiagnostics();
+    for (const [uri, diagnostics] of diagMap) {
+      if (diagnostics.length === 0) continue;
+      let absPath: string;
+      try {
+        absPath = fileURLToPath(uri);
+      } catch {
+        absPath = uri;
+      }
+      const relPath = relative(rootDir, absPath);
+      for (const diag of diagnostics) {
+        allDiagnostics.push({ relPath, diag });
+      }
+    }
+  }
+
+  if (allDiagnostics.length === 0) {
+    const langs = running.map((s) => s.languageId).join(", ");
+    return {
+      content: [{ type: "text" as const, text: `No diagnostics across ${running.length} running server(s) (${langs}).` }],
+      details: { count: 0 },
+    };
+  }
+
+  // Sort: errors first, then by file path
+  allDiagnostics.sort((a, b) => {
+    const sevDiff = (a.diag.severity ?? 99) - (b.diag.severity ?? 99);
+    if (sevDiff !== 0) return sevDiff;
+    return a.relPath.localeCompare(b.relPath);
+  });
+
+  const errors = allDiagnostics.filter((d) => d.diag.severity === DiagnosticSeverity.Error).length;
+  const warnings = allDiagnostics.filter((d) => d.diag.severity === DiagnosticSeverity.Warning).length;
+  const other = allDiagnostics.length - errors - warnings;
+  const fileCount = new Set(allDiagnostics.map((d) => d.relPath)).size;
+
+  const summary = [
+    `${allDiagnostics.length} diagnostic(s) in ${fileCount} file(s)`,
+    errors > 0 ? `${errors} error(s)` : null,
+    warnings > 0 ? `${warnings} warning(s)` : null,
+    other > 0 ? `${other} other` : null,
+  ].filter(Boolean).join(", ");
+
+  const lines = allDiagnostics.map((d) => formatDiagnostic(d.diag, d.relPath));
+  const output = lines.join("\n");
+
+  const truncation = truncateHead(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+  let resultText = `${summary}\n\n${truncation.content}`;
+  if (truncation.truncated) {
+    resultText += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} diagnostics]`;
+  }
+
+  return {
+    content: [{ type: "text" as const, text: resultText }],
+    details: { count: allDiagnostics.length, errors, warnings, files: fileCount },
   };
 }
