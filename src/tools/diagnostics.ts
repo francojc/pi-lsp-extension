@@ -34,7 +34,7 @@ function formatDiagnostic(diag: Diagnostic, filePath: string): string {
 }
 
 const DiagnosticsParams = Type.Object({
-  path: Type.Optional(Type.String({ description: "File path to get diagnostics for. Omit to get all workspace diagnostics from running LSP servers." })),
+  path: Type.String({ description: "File path to get diagnostics for. Pass \"*\" to get all workspace diagnostics from all running LSP servers." }),
 });
 
 interface DiagnosticsDetails {
@@ -48,22 +48,21 @@ export function createDiagnosticsTool(manager: LspManager): ToolDefinition<typeo
   return {
     name: "lsp_diagnostics",
     label: "LSP Diagnostics",
-    description: "Get compilation errors and warnings from the LSP server. Pass a file path to check a single file, or omit path to get all cached diagnostics across the workspace.",
-    promptSnippet: "Get compiler errors, warnings, and hints for a source file via LSP. Omit path to get all workspace diagnostics.",
+    description: "Get compilation errors and warnings from the LSP server. Pass a file path to check a single file, or pass \"*\" to get all cached diagnostics across the workspace.",
+    promptSnippet: "Get compiler errors, warnings, and hints for a source file via LSP. Pass path=\"*\" to get all workspace diagnostics.",
     promptGuidelines: [
       "After making code changes with edit or write, use lsp_diagnostics to check for compilation errors before moving on.",
-      "To review all workspace diagnostics at once, call lsp_diagnostics with no arguments — this returns all cached diagnostics from running LSP servers without needing to check files individually.",
+      "To review all workspace diagnostics at once, call lsp_diagnostics with path=\"*\" — this returns all cached diagnostics from running LSP servers without needing to check files individually.",
     ],
     parameters: DiagnosticsParams,
 
     async execute(_toolCallId, params) {
-      // Workspace-wide mode: no path provided
-      if (!params.path) {
+      const filePath = params.path.replace(/^@/, "");
+
+      // Workspace-wide mode
+      if (filePath === "*" || filePath === "") {
         return executeWorkspaceDiagnostics(manager);
       }
-
-      // Single-file mode
-      const filePath = params.path.replace(/^@/, "");
       const client = await manager.getClientForFile(filePath).catch(() => null);
 
       if (!client) {
@@ -109,7 +108,7 @@ export function createDiagnosticsTool(manager: LspManager): ToolDefinition<typeo
 
     renderCall(args, theme) {
       let text = theme.fg("toolTitle", theme.bold("lsp_diagnostics "));
-      if (args.path) {
+      if (args.path && args.path !== "*") {
         text += theme.fg("accent", args.path);
       } else {
         text += theme.fg("dim", "(workspace)");
