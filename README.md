@@ -70,6 +70,7 @@ Add more at runtime:
 |---------|-------------|
 | `/lsp` | Show status of running LSP servers |
 | `/lsp-config <lang> <cmd> [args]` | Configure a language server |
+| `/lsp-lombok [path]` | Set Lombok jar path for Java (or show current) |
 | `/bemol [run\|watch\|stop\|status]` | Manage bemol (Brazil workspaces) |
 
 ## How it Works
@@ -79,6 +80,25 @@ Add more at runtime:
 3. **Diagnostics cache** — the server pushes diagnostics asynchronously; tools read from a local cache
 4. **Auto-diagnostics** — errors are appended to write/edit results when a server is running
 5. **Shared daemons** — in supported workspaces, LSP servers run as background daemons shared across pi sessions
+
+## Lombok Support (Java)
+
+If your Java project uses [Lombok](https://projectlombok.org/), jdtls needs the Lombok agent jar to understand generated code. The extension resolves the jar in this order:
+
+1. **`/lsp-lombok` command** — set the path at runtime:
+   ```
+   /lsp-lombok /path/to/lombok.jar
+   ```
+
+2. **`LOMBOK_JAR` environment variable** — set before starting pi:
+   ```bash
+   export LOMBOK_JAR=/path/to/lombok.jar
+   pi
+   ```
+
+3. **Auto-detection** — in Brazil workspaces, the extension searches `env/Lombok-*/runtime/lib/` and `env/gradle-cache-2/` automatically.
+
+Run `/lsp-lombok` with no arguments to see which jar is currently configured.
 
 ## Architecture
 

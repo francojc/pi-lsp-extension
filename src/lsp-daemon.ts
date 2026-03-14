@@ -116,6 +116,7 @@ const lspArgs = args.slice(2);
 const rootDir = process.env.LSP_ROOT_DIR || process.cwd();
 const languageId = process.env.LSP_LANGUAGE_ID || "unknown";
 const workspaceFoldersJson = process.env.LSP_WORKSPACE_FOLDERS;
+const initializationOptionsJson = process.env.LSP_INITIALIZATION_OPTIONS;
 
 if (!socketPath || !lspCommand) {
   console.error("Usage: lsp-daemon.js <socketPath> <command> [args...]");
@@ -217,6 +218,13 @@ async function initializeLsp(): Promise<void> {
       } catch { /* use default */ }
     }
 
+    let initializationOptions: Record<string, unknown> | undefined;
+    if (initializationOptionsJson) {
+      try {
+        initializationOptions = JSON.parse(initializationOptionsJson);
+      } catch { /* ignore */ }
+    }
+
     const initParams = {
       processId: process.pid,
       capabilities: {
@@ -234,6 +242,7 @@ async function initializeLsp(): Promise<void> {
       },
       rootUri,
       workspaceFolders,
+      ...(initializationOptions ? { initializationOptions } : {}),
     };
 
     const requestId = nextDaemonRequestId++;

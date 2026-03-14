@@ -43,6 +43,8 @@ export interface LspClientOptions {
   workspaceFolders?: { uri: string; name: string }[];
   /** Connect to existing daemon socket instead of spawning a new process */
   socketPath?: string;
+  /** LSP initializationOptions (e.g. jdtls settings for Lombok) */
+  initializationOptions?: Record<string, unknown>;
 }
 
 export class LspClient {
@@ -299,6 +301,9 @@ export class LspClient {
       },
       rootUri,
       workspaceFolders,
+      ...(this.options.initializationOptions
+        ? { initializationOptions: this.options.initializationOptions }
+        : {}),
     };
 
     const result: InitializeResult = await this.connection.sendRequest(

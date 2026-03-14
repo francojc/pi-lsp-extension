@@ -5,9 +5,9 @@
  * Integrates with bemol for Brazil workspace support.
  */
 
-import { resolve, join } from "node:path";
+import { resolve, join, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { spawn as spawnChild } from "node:child_process";
 import { LspClient } from "./lsp-client.js";
 import { BemolManager } from "./bemol.js";
@@ -89,6 +89,7 @@ export class LspManager {
   private _bemolEnsuring: Promise<boolean> | null = null;
   private _callbacks: LspManagerCallbacks;
   private _sessionId: string;
+  private _lombokJarPath: string | null = null;
 
   constructor(rootDir: string, customConfigs?: Record<string, ServerConfig>, callbacks?: LspManagerCallbacks, sessionId?: string) {
     this.rootDir = resolve(rootDir);
@@ -109,6 +110,82 @@ export class LspManager {
   /** Update or add a server configuration */
   setServerConfig(languageId: string, config: ServerConfig): void {
     this.serverConfigs.set(languageId, config);
+  }
+
+  /** Set an explicit path to a Lombok jar for Java/jdtls support */
+  setLombokJar(jarPath: string): void {
+    this._lombokJarPath = resolve(this.rootDir, jarPath);
+  }
+
+  /** Get the currently configured Lombok jar path (if any) */
+  getLombokJar(): string | null {
+    return this.findLombokJar();
+  }
+
+  /**
+   * Auto-detect Lombok jar in a Brazil workspace.
+   * Searches common locations: env/Lombok-{version}/runtime/lib/, env/gradle-cache-2/org/projectlombok/
+   */
+  private findLombokJar(): string | null {
+    // 1. Explicit path set via setLombokJar()
+    if (this._lombokJarPath) {
+      if (existsSync(this._lombokJarPath)) return this._lombokJarPath;
+    }
+
+    // 2. LOMBOK_JAR environment variable
+    const envJar = process.env.LOMBOK_JAR;
+    if (envJar) {
+      const resolved = resolve(this.rootDir, envJar);
+      if (existsSync(resolved)) return resolved;
+    }
+
+    // 3. Auto-detect in Brazil workspace: env/Lombok-{version}/runtime/lib/lombok-*.jar
+    const envDir = join(this.rootDir, "env");
+    if (existsSync(envDir)) {
+      try {
+        const lombokDirs = readdirSync(envDir).filter(d => d.startsWith("Lombok-"));
+        for (const dir of lombokDirs) {
+          const libDir = join(envDir, dir, "runtime", "lib");
+          if (existsSync(libDir)) {
+            const jars = readdirSync(libDir).filter(f => f.startsWith("lombok-") && f.endsWith(".jar"));
+            if (jars.length > 0) return join(libDir, jars[0]);
+          }
+        }
+      } catch { /* ignore */ }
+    }
+
+    // 4. Auto-detect in Brazil workspace: env/gradle-cache-2/org/projectlombok/lombok/{version}/lombok-{version}.jar
+    const gradleLombok = join(envDir, "gradle-cache-2", "org", "projectlombok", "lombok");
+    if (existsSync(gradleLombok)) {
+      try {
+        const versions = readdirSync(gradleLombok);
+        for (const ver of versions) {
+          const jarPath = join(gradleLombok, ver, `lombok-${ver}.jar`);
+          if (existsSync(jarPath)) return jarPath;
+        }
+      } catch { /* ignore */ }
+    }
+
+    return null;
+  }
+
+  /** Build initializationOptions for Java (jdtls) with Lombok support */
+  private getJavaInitializationOptions(): Record<string, unknown> | undefined {
+    const lombokJar = this.findLombokJar();
+    if (!lombokJar) return undefined;
+
+    const vmargs = `-javaagent:${lombokJar}`;
+    return {
+      settings: {
+        java: {
+          jdt: {
+            ls: {
+              vmargs,
+            },
+          },
+        },
+      },
+    };
   }
 
   /** Get all configured languages */
@@ -243,6 +320,11 @@ export class LspManager {
       ? this._bemol.getWorkspaceFolders()
       : undefined;
 
+    // Build language-specific initializationOptions (e.g. Lombok for Java)
+    const initializationOptions = languageId === "java"
+      ? this.getJavaInitializationOptions()
+      : undefined;
+
     // Try connecting to an existing daemon socket first
     const socketPath = this.getSocketPath(languageId);
     if (socketPath && this.isDaemonAlive(languageId)) {
@@ -254,6 +336,7 @@ export class LspManager {
           rootDir: this.rootDir,
           languageId,
           socketPath,
+          initializationOptions,
         });
         await client.start();
         this.clients.set(languageId, client);
@@ -271,7 +354,7 @@ export class LspManager {
     if (wsRoot) {
       // Spawn daemon and connect via socket
       try {
-        await this.spawnDaemon(languageId, config, workspaceFolders);
+        await this.spawnDaemon(languageId, config, workspaceFolders, initializationOptions);
         // Small delay to let daemon start listening
         await new Promise((r) => setTimeout(r, 500));
 
@@ -287,6 +370,7 @@ export class LspManager {
               rootDir: this.rootDir,
               languageId,
               socketPath: daemonSocket,
+              initializationOptions,
             });
             await client.start();
             this.clients.set(languageId, client);
@@ -319,6 +403,7 @@ export class LspManager {
       languageId,
       env: config.env,
       workspaceFolders,
+      initializationOptions,
     });
 
     try {
@@ -363,6 +448,7 @@ export class LspManager {
     languageId: string,
     config: ServerConfig,
     workspaceFolders?: { uri: string; name: string }[],
+    initializationOptions?: Record<string, unknown>,
   ): Promise<void> {
     const socketPath = this.getSocketPath(languageId)!;
     const daemonScript = new URL("./lsp-daemon.ts", import.meta.url).pathname;
@@ -389,6 +475,10 @@ export class LspManager {
 
     if (workspaceFolders && workspaceFolders.length > 0) {
       env.LSP_WORKSPACE_FOLDERS = JSON.stringify(workspaceFolders);
+    }
+
+    if (initializationOptions) {
+      env.LSP_INITIALIZATION_OPTIONS = JSON.stringify(initializationOptions);
     }
 
     const child = spawnChild(

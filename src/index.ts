@@ -364,6 +364,48 @@ export default function lspExtension(pi: ExtensionAPI) {
     },
   });
 
+  // /lsp-lombok command — set Lombok jar path for Java
+  pi.registerCommand("lsp-lombok", {
+    description:
+      "Set Lombok jar path for Java: /lsp-lombok <path-to-lombok.jar>",
+    handler: async (args, ctx) => {
+      const mgr = getManager();
+
+      if (!args?.trim()) {
+        const current = mgr.getLombokJar();
+        if (current) {
+          ctx.ui.notify(`Lombok jar: ${current}`, "info");
+        } else {
+          ctx.ui.notify(
+            "No Lombok jar configured or detected.\n\n" +
+            "Usage: /lsp-lombok <path-to-lombok.jar>\n" +
+            "Or set LOMBOK_JAR environment variable.\n\n" +
+            "Download from: https://projectlombok.org/download",
+            "info"
+          );
+        }
+        return;
+      }
+
+      const jarPath = args.trim();
+      const { existsSync } = await import("node:fs");
+      const { resolve } = await import("node:path");
+      const resolved = resolve(ctx.cwd, jarPath);
+
+      if (!existsSync(resolved)) {
+        ctx.ui.notify(`File not found: ${resolved}`, "error");
+        return;
+      }
+
+      if (!resolved.endsWith(".jar")) {
+        ctx.ui.notify(`Warning: ${resolved} doesn't end in .jar — setting anyway`, "warning");
+      }
+
+      mgr.setLombokJar(resolved);
+      ctx.ui.notify(`Lombok jar set: ${resolved}`, "info");
+    },
+  });
+
   // Clean shutdown (includes bemol watch and all LSP servers)
   pi.on("session_shutdown", async () => {
     if (manager) {
