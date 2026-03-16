@@ -36,6 +36,8 @@ import { createSymbolsTool } from "./tools/symbols.js";
 import { createRenameTool } from "./tools/rename.js";
 import { createCodeOverviewTool } from "./tools/code-overview.js";
 import { createCompletionsTool } from "./tools/completions.js";
+import { createCodeSearchTool } from "./tools/code-search.js";
+import { createCodeRewriteTool } from "./tools/code-rewrite.js";
 import { relative } from "node:path";
 
 export default function lspExtension(pi: ExtensionAPI) {
@@ -165,6 +167,8 @@ export default function lspExtension(pi: ExtensionAPI) {
     setTrackedVersion: (uri, v) => getFileSync().setTrackedVersion(uri, v),
   }));
   pi.registerTool(createCodeOverviewTool(process.cwd(), treeSitterProxy, workspaceIndexProxy));
+  pi.registerTool(createCodeSearchTool(process.cwd(), treeSitterProxy));
+  pi.registerTool(createCodeRewriteTool(process.cwd(), treeSitterProxy));
 
   // File sync: track file reads/writes/edits
   // After writes/edits, append file-scoped error diagnostics to the tool result
