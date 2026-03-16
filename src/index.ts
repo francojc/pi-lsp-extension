@@ -25,17 +25,22 @@ import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-proto
 
 import { LspManager, type ServerConfig, type LspManagerCallbacks } from "./lsp-manager.js";
 import { FileSync } from "./file-sync.js";
+import { TreeSitterManager } from "./tree-sitter/parser-manager.js";
+import { WorkspaceIndex } from "./tree-sitter/workspace-index.js";
 import { createDiagnosticsTool } from "./tools/diagnostics.js";
 import { createHoverTool } from "./tools/hover.js";
 import { createDefinitionTool } from "./tools/definition.js";
 import { createReferencesTool } from "./tools/references.js";
 import { createSymbolsTool } from "./tools/symbols.js";
 import { createRenameTool } from "./tools/rename.js";
+import { createCodeOverviewTool } from "./tools/code-overview.js";
 import { relative } from "node:path";
 
 export default function lspExtension(pi: ExtensionAPI) {
   let manager: LspManager | null = null;
   let fileSync: FileSync | null = null;
+  let treeSitter: TreeSitterManager | null = null;
+  let workspaceIndex: WorkspaceIndex | null = null;
   // Store latest ctx for lifecycle callbacks (updated on each event)
   let latestCtx: any = null;
 
@@ -68,6 +73,9 @@ export default function lspExtension(pi: ExtensionAPI) {
     if (!manager) {
       manager = new LspManager(process.cwd(), undefined, makeCallbacks());
       fileSync = new FileSync(manager);
+      treeSitter = new TreeSitterManager();
+      workspaceIndex = new WorkspaceIndex(process.cwd(), treeSitter);
+      fileSync.setTreeSitter(treeSitter, workspaceIndex);
     }
     return manager;
   };
@@ -79,11 +87,31 @@ export default function lspExtension(pi: ExtensionAPI) {
     return fileSync!;
   };
 
+  const getTreeSitter = (): TreeSitterManager => {
+    if (!treeSitter) {
+      getManager(); // ensures treeSitter is created
+    }
+    return treeSitter!;
+  };
+
+  const getWorkspaceIndex = (): WorkspaceIndex => {
+    if (!workspaceIndex) {
+      getManager(); // ensures workspaceIndex is created
+    }
+    return workspaceIndex!;
+  };
+
   // Initialize manager (uses cwd at session start time)
   pi.on("session_start", async (_event, ctx) => {
     latestCtx = ctx;
     manager = new LspManager(ctx.cwd, undefined, makeCallbacks());
     fileSync = new FileSync(manager);
+    treeSitter = new TreeSitterManager();
+    workspaceIndex = new WorkspaceIndex(ctx.cwd, treeSitter);
+    fileSync.setTreeSitter(treeSitter, workspaceIndex);
+
+    // Initialize tree-sitter in the background (don't block session start)
+    treeSitter.init().catch(() => {});
 
     // Detect Brazil workspace and show appropriate status
     const bemol = manager.bemol;
@@ -112,12 +140,25 @@ export default function lspExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool(createDiagnosticsTool(managerProxy));
-  pi.registerTool(createHoverTool(managerProxy));
-  pi.registerTool(createDefinitionTool(managerProxy));
+  const treeSitterProxy = new Proxy({} as TreeSitterManager, {
+    get(_target, prop) {
+      return (getTreeSitter() as any)[prop];
+    },
+  });
+
+  const workspaceIndexProxy = new Proxy({} as WorkspaceIndex, {
+    get(_target, prop) {
+      return (getWorkspaceIndex() as any)[prop];
+    },
+  });
+
+  pi.registerTool(createDiagnosticsTool(managerProxy, treeSitterProxy));
+  pi.registerTool(createHoverTool(managerProxy, treeSitterProxy));
+  pi.registerTool(createDefinitionTool(managerProxy, treeSitterProxy, workspaceIndexProxy));
   pi.registerTool(createReferencesTool(managerProxy));
-  pi.registerTool(createSymbolsTool(managerProxy));
+  pi.registerTool(createSymbolsTool(managerProxy, treeSitterProxy, workspaceIndexProxy));
   pi.registerTool(createRenameTool(managerProxy));
+  pi.registerTool(createCodeOverviewTool(process.cwd(), treeSitterProxy, workspaceIndexProxy));
 
   // File sync: track file reads/writes/edits
   // After writes/edits, append file-scoped error diagnostics to the tool result
@@ -406,12 +447,17 @@ export default function lspExtension(pi: ExtensionAPI) {
     },
   });
 
-  // Clean shutdown (includes bemol watch and all LSP servers)
+  // Clean shutdown (includes bemol watch, all LSP servers, and tree-sitter)
   pi.on("session_shutdown", async () => {
     if (manager) {
       await manager.shutdownAll();
       manager = null;
       fileSync = null;
     }
+    if (treeSitter) {
+      treeSitter.shutdown();
+      treeSitter = null;
+    }
+    workspaceIndex = null;
   });
 }

@@ -7,6 +7,8 @@
 
 import { readFile } from "node:fs/promises";
 import { LspManager } from "./lsp-manager.js";
+import type { TreeSitterManager } from "./tree-sitter/parser-manager.js";
+import type { WorkspaceIndex } from "./tree-sitter/workspace-index.js";
 
 interface TrackedDocument {
   uri: string;
@@ -16,8 +18,16 @@ interface TrackedDocument {
 
 export class FileSync {
   private tracked: Map<string, TrackedDocument> = new Map();
+  private treeSitter: TreeSitterManager | null = null;
+  private workspaceIndex: WorkspaceIndex | null = null;
 
   constructor(private manager: LspManager) {}
+
+  /** Set the tree-sitter manager for cache invalidation */
+  setTreeSitter(treeSitter: TreeSitterManager, workspaceIndex?: WorkspaceIndex): void {
+    this.treeSitter = treeSitter;
+    this.workspaceIndex = workspaceIndex ?? null;
+  }
 
   /**
    * Handle a file being read — sends didOpen if not yet tracked.
@@ -55,6 +65,16 @@ export class FileSync {
     const absPath = this.manager.resolvePath(filePath);
     const uri = this.manager.getFileUri(absPath);
     const languageId = this.manager.getLanguageId(absPath);
+
+    // Invalidate tree-sitter cache and re-index
+    if (this.treeSitter) {
+      this.treeSitter.invalidate(absPath);
+      if (this.workspaceIndex) {
+        // Re-index in the background (don't block the write)
+        this.workspaceIndex.indexFile(absPath).catch(() => {});
+      }
+    }
+
     if (!languageId) return;
 
     // Get client (start server lazily if configured)

@@ -11,6 +11,10 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { truncateHead, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { LspManager } from "../lsp-manager.js";
+import type { TreeSitterManager } from "../tree-sitter/parser-manager.js";
+import { resolveProvider } from "../resolve-provider.js";
+import { getSyntaxErrors } from "../tree-sitter/symbol-extractor.js";
+import { readFile } from "node:fs/promises";
 import { relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -44,7 +48,10 @@ interface DiagnosticsDetails {
   files?: number;
 }
 
-export function createDiagnosticsTool(manager: LspManager): ToolDefinition<typeof DiagnosticsParams, DiagnosticsDetails> {
+export function createDiagnosticsTool(
+  manager: LspManager,
+  treeSitter?: TreeSitterManager | null,
+): ToolDefinition<typeof DiagnosticsParams, DiagnosticsDetails> {
   return {
     name: "lsp_diagnostics",
     label: "LSP Diagnostics",
@@ -65,45 +72,78 @@ export function createDiagnosticsTool(manager: LspManager): ToolDefinition<typeo
       }
       const client = await manager.getClientForFile(filePath).catch(() => null);
 
-      if (!client) {
+      if (client) {
+        // LSP path
+        const uri = manager.getFileUri(filePath);
+        const diagnostics = client.getDiagnostics(uri);
+
+        if (diagnostics.length === 0) {
+          return { content: [{ type: "text", text: "No diagnostics (clean)." }], details: { count: 0 } };
+        }
+
+        const sorted = [...diagnostics].sort((a, b) => (a.severity ?? 99) - (b.severity ?? 99));
+        const relPath = relative(manager.resolvePath("."), manager.resolvePath(filePath));
+        const lines = sorted.map((d) => formatDiagnostic(d, relPath));
+        const output = lines.join("\n");
+
+        const errors = sorted.filter((d) => d.severity === DiagnosticSeverity.Error).length;
+        const warnings = sorted.filter((d) => d.severity === DiagnosticSeverity.Warning).length;
+        const other = sorted.length - errors - warnings;
+
+        const summary = [
+          errors > 0 ? `${errors} error(s)` : null,
+          warnings > 0 ? `${warnings} warning(s)` : null,
+          other > 0 ? `${other} other` : null,
+        ].filter(Boolean).join(", ");
+
+        const truncation = truncateHead(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+        let resultText = `${summary}\n\n${truncation.content}`;
+        if (truncation.truncated) {
+          resultText += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} diagnostics]`;
+        }
+
         return {
-          content: [{ type: "text", text: manager.getUnavailableReason(filePath) }],
-          details: { count: 0 },
-        } as any;
+          content: [{ type: "text", text: resultText }],
+          details: { count: sorted.length, errors, warnings },
+        };
       }
 
-      const uri = manager.getFileUri(filePath);
-      const diagnostics = client.getDiagnostics(uri);
-
-      if (diagnostics.length === 0) {
-        return { content: [{ type: "text", text: "No diagnostics (clean)." }], details: { count: 0 } };
-      }
-
-      const sorted = [...diagnostics].sort((a, b) => (a.severity ?? 99) - (b.severity ?? 99));
-      const relPath = relative(manager.resolvePath("."), manager.resolvePath(filePath));
-      const lines = sorted.map((d) => formatDiagnostic(d, relPath));
-      const output = lines.join("\n");
-
-      const errors = sorted.filter((d) => d.severity === DiagnosticSeverity.Error).length;
-      const warnings = sorted.filter((d) => d.severity === DiagnosticSeverity.Warning).length;
-      const other = sorted.length - errors - warnings;
-
-      const summary = [
-        errors > 0 ? `${errors} error(s)` : null,
-        warnings > 0 ? `${warnings} warning(s)` : null,
-        other > 0 ? `${other} other` : null,
-      ].filter(Boolean).join(", ");
-
-      const truncation = truncateHead(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-      let resultText = `${summary}\n\n${truncation.content}`;
-      if (truncation.truncated) {
-        resultText += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} diagnostics]`;
+      // Tree-sitter fallback: report syntax errors
+      if (treeSitter) {
+        const provider = resolveProvider(filePath, manager, treeSitter);
+        if (provider.type === "tree-sitter") {
+          try {
+            const absPath = manager.resolvePath(filePath);
+            const content = await readFile(absPath, "utf-8");
+            const tree = await treeSitter.parse(absPath, content);
+            if (tree) {
+              const syntaxErrors = getSyntaxErrors(tree);
+              if (syntaxErrors.length === 0) {
+                return { content: [{ type: "text", text: "No syntax errors detected. [tree-sitter — syntax only, no type checking]" }], details: { count: 0 } };
+              }
+              const relPath = relative(manager.resolvePath("."), absPath);
+              const lines = syntaxErrors.map((e) =>
+                `${relPath}:${e.line + 1}:${e.character + 1} error: ${e.message}`
+              );
+              const output = lines.join("\n");
+              const truncation = truncateHead(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+              let resultText = `${syntaxErrors.length} syntax error(s) [tree-sitter — syntax only, no type checking]\n\n${truncation.content}`;
+              if (truncation.truncated) {
+                resultText += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} diagnostics]`;
+              }
+              return {
+                content: [{ type: "text", text: resultText }],
+                details: { count: syntaxErrors.length, errors: syntaxErrors.length },
+              };
+            }
+          } catch { /* fall through */ }
+        }
       }
 
       return {
-        content: [{ type: "text", text: resultText }],
-        details: { count: sorted.length, errors, warnings },
-      };
+        content: [{ type: "text", text: manager.getUnavailableReason(filePath) }],
+        details: { count: 0 },
+      } as any;
     },
 
     renderCall(args, theme) {
