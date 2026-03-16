@@ -128,7 +128,7 @@ export function extractSymbols(tree: Tree, languageId: string): SymbolInfo[] {
   return extractFromNode(tree.rootNode, mappings, languageId);
 }
 
-function extractFromNode(node: Node, mappings: SymbolMapping[], languageId: string): SymbolInfo[] {
+function extractFromNode(node: Node, mappings: SymbolMapping[], languageId: string, deep = false): SymbolInfo[] {
   const symbols: SymbolInfo[] = [];
 
   for (const child of node.namedChildren) {
@@ -143,15 +143,19 @@ function extractFromNode(node: Node, mappings: SymbolMapping[], languageId: stri
           endLine: child.endPosition.row + 1,
         };
         if (mapping.recurse) {
-          const children = extractFromNode(child, mappings, languageId);
+          const children = extractFromNode(child, mappings, languageId, true);
           if (children.length > 0) sym.children = children;
         }
         symbols.push(sym);
       }
     } else if (child.type === "export_statement" && (languageId.startsWith("typescript") || languageId.startsWith("javascript"))) {
       // Unwrap export statements to find the actual declaration
-      const inner = extractFromNode(child, mappings, languageId);
+      const inner = extractFromNode(child, mappings, languageId, deep);
       symbols.push(...inner);
+    } else if (deep && child.namedChildCount > 0) {
+      // Walk through container nodes (class_body, interface_body, etc.)
+      // to find nested declarations when recursing inside a parent
+      symbols.push(...extractFromNode(child, mappings, languageId, true));
     }
   }
 
