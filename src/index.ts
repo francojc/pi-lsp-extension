@@ -28,6 +28,7 @@ import { LspManager, type ServerConfig, type LspManagerCallbacks } from "./lsp-m
 import { FileSync } from "./file-sync.js";
 import { TreeSitterManager } from "./tree-sitter/parser-manager.js";
 import { WorkspaceIndex } from "./tree-sitter/workspace-index.js";
+import { type WorkspaceProvider, DefaultWorkspaceProvider } from "./workspace-provider.js";
 import { createDiagnosticsTool } from "./tools/diagnostics.js";
 import { createHoverTool } from "./tools/hover.js";
 import { createDefinitionTool } from "./tools/definition.js";
@@ -86,8 +87,31 @@ export default function lspExtension(pi: ExtensionAPI) {
   let fileSync: FileSync | null = null;
   let treeSitter: TreeSitterManager | null = null;
   let workspaceIndex: WorkspaceIndex | null = null;
+  let pendingProvider: WorkspaceProvider | null = null;
   // Store latest ctx for lifecycle callbacks (updated on each event)
   let latestCtx: any = null;
+
+  // Listen for external workspace providers (e.g. bemol extension).
+  // Also check if one was already registered before we loaded (load order varies).
+  // Store as pendingProvider so it's available when the manager is created later.
+  const applyProvider = (data: unknown) => {
+    const provider = data as WorkspaceProvider;
+    pendingProvider = provider;
+    if (manager) {
+      manager.setWorkspaceProvider(provider);
+    }
+    // Update status if we have a UI context
+    const statusText = provider.getStatusText();
+    if (statusText && latestCtx?.ui?.theme) {
+      latestCtx.ui.setStatus("lsp", latestCtx.ui.theme.fg("accent", `LSP: ${statusText}`));
+    }
+  };
+
+  pi.events.on("lsp:register-workspace-provider", applyProvider);
+
+  // Check for provider registered before our listener existed
+  const existing = (pi.events as any)["lsp:workspace-provider"];
+  if (existing) applyProvider(existing);
 
   /** Build lifecycle callbacks that update UI status */
   const setLspStatus = (color: string, text: string) => {
@@ -97,15 +121,15 @@ export default function lspExtension(pi: ExtensionAPI) {
   };
 
   const makeCallbacks = (): LspManagerCallbacks => ({
-    onBemolStart: () => {
-      setLspStatus("warning", "LSP: running bemol...");
+    onWorkspaceSetupStart: () => {
+      setLspStatus("warning", "LSP: workspace setup...");
     },
-    onBemolEnd: (success: boolean, duration: number) => {
+    onWorkspaceSetupEnd: (success: boolean, duration: number) => {
       const secs = (duration / 1000).toFixed(1);
       if (success) {
-        setLspStatus("accent", `LSP: bemol done (${secs}s)`);
+        setLspStatus("accent", `LSP: workspace ready (${secs}s)`);
       } else {
-        setLspStatus("warning", `LSP: bemol failed (${secs}s)`);
+        setLspStatus("warning", `LSP: workspace setup failed (${secs}s)`);
       }
     },
     onServerStart: (languageId: string, command: string) => {
@@ -122,7 +146,7 @@ export default function lspExtension(pi: ExtensionAPI) {
   // Create manager eagerly so tools can reference it, but servers start lazily
   const getManager = (): LspManager => {
     if (!manager) {
-      manager = new LspManager(process.cwd(), undefined, makeCallbacks());
+      manager = new LspManager(process.cwd(), undefined, makeCallbacks(), undefined, pendingProvider ?? undefined);
       fileSync = new FileSync(manager);
       fileSync.setSyntheticDotChecker((uri) => syntheticDotLocks.has(uri));
       treeSitter = new TreeSitterManager();
@@ -164,7 +188,7 @@ export default function lspExtension(pi: ExtensionAPI) {
       if (treeSitter) treeSitter.shutdown();
     }
 
-    manager = new LspManager(ctx.cwd, undefined, makeCallbacks());
+    manager = new LspManager(ctx.cwd, undefined, makeCallbacks(), undefined, pendingProvider ?? undefined);
     fileSync = new FileSync(manager);
     fileSync.setSyntheticDotChecker((uri) => syntheticDotLocks.has(uri));
     treeSitter = new TreeSitterManager();
@@ -176,20 +200,11 @@ export default function lspExtension(pi: ExtensionAPI) {
       console.error(`[pi-lsp-extension] tree-sitter WASM init failed: ${err?.message ?? err}`);
     });
 
-    // Detect Brazil workspace and show appropriate status
-    const bemol = manager.bemol;
-    if (bemol.isBrazilWorkspace) {
-      const hasBemol = bemol.bemolAvailable;
-      const hasConfig = bemol.hasConfig();
-      let status = "LSP: Brazil workspace";
-      if (hasConfig) {
-        status += " (bemol config found)";
-      } else if (hasBemol) {
-        status += " (bemol will run on first LSP use)";
-      } else {
-        status += " (bemol not installed)";
-      }
-      ctx.ui.setStatus("lsp", ctx.ui.theme.fg("accent", status));
+    // Show workspace provider status
+    const wsProvider = manager.workspace;
+    const statusText = wsProvider.getStatusText();
+    if (statusText) {
+      ctx.ui.setStatus("lsp", ctx.ui.theme.fg("accent", `LSP: ${statusText}`));
     } else {
       ctx.ui.setStatus("lsp", ctx.ui.theme.fg("dim", "LSP: idle"));
     }
@@ -222,7 +237,7 @@ export default function lspExtension(pi: ExtensionAPI) {
         const langs = projectConfig.autoStart;
         const lombokNote = langs.includes("java") && manager.getLombokJar()
           ? ` (lombok: ${manager.getLombokJar()?.split("/").pop()})` : "";
-        ctx.ui.setStatus("lsp", ctx.ui.theme.fg("warning", `LSP: auto-starting ${langs.join(", ")}${lombokNote}...`));
+        setLspStatus("warning", `LSP: auto-starting ${langs.join(", ")}${lombokNote}...`);
         manager.startEagerly(langs);
       }
     }
@@ -422,125 +437,6 @@ export default function lspExtension(pi: ExtensionAPI) {
     },
   });
 
-  // /bemol command — run bemol, manage watch mode
-  pi.registerCommand("bemol", {
-    description: "Manage bemol: /bemol [run|watch|stop|status]",
-    handler: async (args, ctx) => {
-      const mgr = getManager();
-      const bemol = mgr.bemol;
-
-      const subcommand = args?.trim().toLowerCase() || "run";
-
-      // Allow 'status' even outside Brazil workspaces
-      if (!bemol.isBrazilWorkspace && subcommand !== "status") {
-        ctx.ui.notify("Not in a Brazil workspace (no packageInfo found)", "warning");
-        return;
-      }
-
-      switch (subcommand) {
-        case "run": {
-          if (!bemol.bemolAvailable) {
-            ctx.ui.notify("bemol is not installed. Run: toolbox install bemol", "warning");
-            return;
-          }
-          ctx.ui.setStatus("lsp", ctx.ui.theme.fg("warning", "LSP: running bemol..."));
-          ctx.ui.notify("Running bemol --verbose...", "info");
-          const result = await bemol.runBemol();
-          if (result.success) {
-            const roots = bemol.getWorkspaceRoots();
-            ctx.ui.notify(
-              `bemol completed in ${(result.duration / 1000).toFixed(1)}s\n${roots.length} package root(s) configured`,
-              "info"
-            );
-          } else {
-            ctx.ui.notify(`bemol failed:\n${result.output.slice(0, 500)}`, "error");
-          }
-          // Reset status
-          ctx.ui.setStatus("lsp", ctx.ui.theme.fg("accent", "LSP: Brazil workspace (bemol done)"));
-          break;
-        }
-
-        case "watch": {
-          if (!bemol.bemolAvailable) {
-            ctx.ui.notify("bemol is not installed. Run: toolbox install bemol", "warning");
-            return;
-          }
-          if (bemol.isWatching) {
-            ctx.ui.notify("bemol --watch is already running", "info");
-            return;
-          }
-          const started = bemol.startWatch();
-          if (started) {
-            ctx.ui.notify("Started bemol --watch in background", "info");
-            ctx.ui.setStatus("bemol", ctx.ui.theme.fg("accent", "bemol: watching"));
-          } else {
-            ctx.ui.notify("Failed to start bemol --watch", "error");
-          }
-          break;
-        }
-
-        case "stop": {
-          if (!bemol.isWatching) {
-            ctx.ui.notify("bemol --watch is not running", "info");
-            return;
-          }
-          bemol.stopWatch();
-          ctx.ui.notify("Stopped bemol --watch", "info");
-          ctx.ui.setStatus("bemol", "");
-          break;
-        }
-
-        case "status": {
-          const status = bemol.getStatus();
-          const lines = [
-            `Brazil workspace: ${status.isBrazilWorkspace ? "yes" : "no"}`,
-            `Workspace root: ${status.workspaceRoot ?? "N/A"}`,
-            `bemol available: ${status.bemolAvailable ? "yes" : "no"}`,
-            `bemol config: ${status.hasConfig ? "yes" : "missing"}`,
-            `bemol watch: ${status.watching ? "running" : "stopped"}`,
-            `Package roots: ${status.workspaceRoots.length}`,
-          ];
-          if (status.workspaceRoots.length > 0) {
-            const shown = status.workspaceRoots.slice(0, 10);
-            for (const root of shown) {
-              lines.push(`  ${root}`);
-            }
-            if (status.workspaceRoots.length > 10) {
-              lines.push(`  ... and ${status.workspaceRoots.length - 10} more`);
-            }
-          }
-
-          // Also show LSP server status for visibility
-          if (manager) {
-            const lspStatuses = manager.getStatus();
-            if (lspStatuses.length > 0) {
-              lines.push("");
-              lines.push("LSP servers:");
-              for (const s of lspStatuses) {
-                const icon = s.running ? "🟢" : "⚪";
-                const diags = s.diagnosticsCount > 0 ? ` (${s.diagnosticsCount} diagnostics)` : "";
-                const shared = s.shared ? " [shared]" : "";
-                lines.push(`  ${icon} ${s.languageId}: ${s.command}${diags}${shared}`);
-              }
-            } else {
-              lines.push("");
-              lines.push("LSP servers: none running");
-            }
-          }
-
-          ctx.ui.notify(lines.join("\n"), "info");
-          break;
-        }
-
-        default:
-          ctx.ui.notify(
-            "Usage: /bemol [run|watch|stop|status]\n  run    — run bemol --verbose\n  watch  — start bemol --watch\n  stop   — stop bemol --watch\n  status — show bemol status",
-            "info"
-          );
-      }
-    },
-  });
-
   // /lsp-config command — add or override server configuration
   pi.registerCommand("lsp-config", {
     description:
@@ -616,7 +512,7 @@ export default function lspExtension(pi: ExtensionAPI) {
     },
   });
 
-  // Clean shutdown (includes bemol watch, all LSP servers, and tree-sitter)
+  // Clean shutdown (includes workspace provider, all LSP servers, and tree-sitter)
   pi.on("session_shutdown", async () => {
     if (manager) {
       await manager.shutdownAll();

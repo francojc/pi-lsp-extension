@@ -39,7 +39,7 @@ export interface LspClientOptions {
   languageId: string;
   /** Extra environment variables */
   env?: Record<string, string>;
-  /** Additional workspace folders (e.g. from bemol for Brazil multi-package workspaces) */
+  /** Additional workspace folders (e.g. for multi-package workspaces) */
   workspaceFolders?: { uri: string; name: string }[];
   /** Connect to existing daemon socket instead of spawning a new process */
   socketPath?: string;
@@ -261,7 +261,7 @@ export class LspClient {
     const rootUri = pathToFileURL(this.rootDir).toString();
     const defaultFolder = { uri: rootUri, name: this.rootDir.split("/").pop() ?? "workspace" };
 
-    // Use provided workspace folders (e.g. from bemol) or fall back to single root
+    // Use provided workspace folders or fall back to single root
     const workspaceFolders = this.options.workspaceFolders && this.options.workspaceFolders.length > 0
       ? this.options.workspaceFolders
       : [defaultFolder];

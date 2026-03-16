@@ -2,7 +2,7 @@
  * LSP Manager — manages multiple LSP server instances, one per language.
  *
  * Lazily starts servers on first use. Auto-detects language from file extension.
- * Integrates with bemol for Brazil workspace support.
+ * Uses a WorkspaceProvider for workspace detection, multi-root folders, and daemon state.
  */
 
 import { resolve, join, dirname } from "node:path";
@@ -10,7 +10,7 @@ import { pathToFileURL } from "node:url";
 import { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { spawn as spawnChild } from "node:child_process";
 import { LspClient } from "./lsp-client.js";
-import { BemolManager } from "./bemol.js";
+import { type WorkspaceProvider, DefaultWorkspaceProvider } from "./workspace-provider.js";
 import { getLanguageIdFromPath } from "./shared/language-map.js";
 import { DAEMON_SOCKET_READY_DELAY_MS, DAEMON_RETRY_INTERVAL_MS, DAEMON_MAX_RETRIES } from "./shared/timing.js";
 
@@ -22,8 +22,8 @@ export interface ServerConfig {
 
 /** Lifecycle callbacks for UI notifications */
 export interface LspManagerCallbacks {
-  onBemolStart?: () => void;
-  onBemolEnd?: (success: boolean, duration: number) => void;
+  onWorkspaceSetupStart?: () => void;
+  onWorkspaceSetupEnd?: (success: boolean, duration: number) => void;
   onServerStart?: (languageId: string, command: string) => void;
   onServerReady?: (languageId: string) => void;
   onServerError?: (languageId: string, error: string) => void;
@@ -57,27 +57,34 @@ export class LspManager {
   private serverConfigs: Map<string, ServerConfig>;
   private rootDir: string;
   private startingServers: Map<string, Promise<LspClient>> = new Map();
-  private _bemol: BemolManager;
-  private _bemolEnsured = false;
-  private _bemolEnsuring: Promise<boolean> | null = null;
+  private _workspace: WorkspaceProvider;
+  private _workspaceReady = false;
+  private _workspaceReadying: Promise<boolean> | null = null;
   private _callbacks: LspManagerCallbacks;
   private _sessionId: string;
   private _lombokJarPath: string | null = null;
 
-  constructor(rootDir: string, customConfigs?: Record<string, ServerConfig>, callbacks?: LspManagerCallbacks, sessionId?: string) {
+  constructor(rootDir: string, customConfigs?: Record<string, ServerConfig>, callbacks?: LspManagerCallbacks, sessionId?: string, workspace?: WorkspaceProvider) {
     this.rootDir = resolve(rootDir);
     this.serverConfigs = new Map(Object.entries({
       ...DEFAULT_SERVERS,
       ...customConfigs,
     }));
-    this._bemol = new BemolManager(this.rootDir);
+    this._workspace = workspace ?? new DefaultWorkspaceProvider();
     this._callbacks = callbacks ?? {};
     this._sessionId = sessionId ?? `${process.pid}-${Date.now()}`;
   }
 
-  /** Get the bemol manager for status/commands */
-  get bemol(): BemolManager {
-    return this._bemol;
+  /** Get the workspace provider */
+  get workspace(): WorkspaceProvider {
+    return this._workspace;
+  }
+
+  /** Replace the workspace provider (e.g. when an external extension registers one) */
+  setWorkspaceProvider(provider: WorkspaceProvider): void {
+    this._workspace = provider;
+    this._workspaceReady = false;
+    this._workspaceReadying = null;
   }
 
   /** Update or add a server configuration */
@@ -96,8 +103,8 @@ export class LspManager {
   }
 
   /**
-   * Auto-detect Lombok jar in a Brazil workspace.
-   * Searches common locations: env/Lombok-{version}/runtime/lib/, env/gradle-cache-2/org/projectlombok/
+   * Auto-detect Lombok jar.
+   * Searches: explicit path, LOMBOK_JAR env var, workspace root env/ directories.
    */
   private findLombokJar(): string | null {
     // 1. Explicit path set via setLombokJar()
@@ -112,9 +119,19 @@ export class LspManager {
       if (existsSync(resolved)) return resolved;
     }
 
-    // 3. Auto-detect in Brazil workspace: env/Lombok-{version}/runtime/lib/lombok-*.jar
-    const envDir = join(this.rootDir, "env");
-    if (existsSync(envDir)) {
+    // 3. Auto-detect from workspace root (e.g. Brazil workspace env/ directory)
+    //    Search both workspace root and cwd in case they differ
+    const searchRoots = [this.rootDir];
+    const wsRoot = this._workspace.workspaceRoot;
+    if (wsRoot && wsRoot !== this.rootDir) {
+      searchRoots.unshift(wsRoot);
+    }
+
+    for (const root of searchRoots) {
+      const envDir = join(root, "env");
+      if (!existsSync(envDir)) continue;
+
+      // env/Lombok-{version}/runtime/lib/lombok-*.jar
       try {
         const lombokDirs = readdirSync(envDir).filter(d => d.startsWith("Lombok-"));
         for (const dir of lombokDirs) {
@@ -125,18 +142,18 @@ export class LspManager {
           }
         }
       } catch { /* ignore */ }
-    }
 
-    // 4. Auto-detect in Brazil workspace: env/gradle-cache-2/org/projectlombok/lombok/{version}/lombok-{version}.jar
-    const gradleLombok = join(envDir, "gradle-cache-2", "org", "projectlombok", "lombok");
-    if (existsSync(gradleLombok)) {
-      try {
-        const versions = readdirSync(gradleLombok);
-        for (const ver of versions) {
-          const jarPath = join(gradleLombok, ver, `lombok-${ver}.jar`);
-          if (existsSync(jarPath)) return jarPath;
-        }
-      } catch { /* ignore */ }
+      // env/gradle-cache-2/org/projectlombok/lombok/{version}/lombok-{version}.jar
+      const gradleLombok = join(envDir, "gradle-cache-2", "org", "projectlombok", "lombok");
+      if (existsSync(gradleLombok)) {
+        try {
+          const versions = readdirSync(gradleLombok);
+          for (const ver of versions) {
+            const jarPath = join(gradleLombok, ver, `lombok-${ver}.jar`);
+            if (existsSync(jarPath)) return jarPath;
+          }
+        } catch { /* ignore */ }
+      }
     }
 
     return null;
@@ -280,41 +297,48 @@ export class LspManager {
   }
 
   /**
-   * Ensure bemol config is available (one-time per session).
-   * Deduplicates concurrent calls. Uses workspace lock to prevent
-   * multiple sessions from running bemol simultaneously.
+   * Ensure workspace provider is ready (one-time per session).
+   * Deduplicates concurrent calls.
    */
-  private async ensureBemol(): Promise<void> {
-    if (this._bemolEnsured || !this._bemol.isBrazilWorkspace) return;
-    if (this._bemolEnsuring) {
-      await this._bemolEnsuring;
+  private async ensureWorkspace(): Promise<void> {
+    if (this._workspaceReady) return;
+    if (this._workspaceReadying) {
+      await this._workspaceReadying;
       return;
     }
-    this._callbacks.onBemolStart?.();
+    this._callbacks.onWorkspaceSetupStart?.();
     const start = Date.now();
-    this._bemolEnsuring = this._bemol.ensureBemolConfig(this._sessionId);
+    this._workspaceReadying = this._workspace.ensureReady(this._sessionId);
     try {
-      const success = await this._bemolEnsuring;
-      this._callbacks.onBemolEnd?.(success, Date.now() - start);
+      const success = await this._workspaceReadying;
+      this._callbacks.onWorkspaceSetupEnd?.(success, Date.now() - start);
     } finally {
-      this._bemolEnsured = true;
-      this._bemolEnsuring = null;
+      this._workspaceReady = true;
+      this._workspaceReadying = null;
     }
   }
 
   private async startServer(languageId: string, config: ServerConfig): Promise<LspClient> {
-    // Run bemol if in a Brazil workspace (one-time)
-    await this.ensureBemol();
+    // Ensure workspace provider is ready (one-time setup)
+    await this.ensureWorkspace();
 
-    const wsRoot = this._bemol.workspaceRoot;
-    const workspaceFolders = this._bemol.isBrazilWorkspace
-      ? this._bemol.getWorkspaceFolders()
-      : undefined;
+    const stateDir = this._workspace.stateDir;
+    const folders = this._workspace.getWorkspaceFolders();
+    const workspaceFolders = folders.length > 0 ? folders : undefined;
 
     // Build language-specific initializationOptions (e.g. Lombok for Java)
     const initializationOptions = languageId === "java"
       ? this.getJavaInitializationOptions()
       : undefined;
+
+    // For Java with Lombok, inject --jvm-arg so jdtls launches with -javaagent
+    let effectiveArgs = config.args;
+    if (languageId === "java") {
+      const lombokJar = this.findLombokJar();
+      if (lombokJar) {
+        effectiveArgs = [`--jvm-arg=-javaagent:${lombokJar}`, ...config.args];
+      }
+    }
 
     // Try connecting to an existing daemon socket first
     const socketPath = this.getSocketPath(languageId);
@@ -323,7 +347,7 @@ export class LspManager {
       try {
         const client = new LspClient({
           command: config.command,
-          args: config.args,
+          args: effectiveArgs,
           rootDir: this.rootDir,
           languageId,
           socketPath,
@@ -333,19 +357,20 @@ export class LspManager {
         this.clients.set(languageId, client);
         this.startingServers.delete(languageId);
         this._callbacks.onServerReady?.(languageId);
+        this.triggerPostInit(languageId, client);
         return client;
       } catch {
         // Daemon may be stale — fall through to spawn new one
       }
     }
 
-    // No existing daemon — spawn one (or start direct if no workspace root)
+    // No existing daemon — spawn one (or start direct if no state directory)
     this._callbacks.onServerStart?.(languageId, config.command);
 
-    if (wsRoot) {
+    if (stateDir) {
       // Spawn daemon and connect via socket
       try {
-        await this.spawnDaemon(languageId, config, workspaceFolders, initializationOptions);
+        await this.spawnDaemon(languageId, config, effectiveArgs, workspaceFolders, initializationOptions);
         // Small delay to let daemon start listening
         await new Promise((r) => setTimeout(r, DAEMON_SOCKET_READY_DELAY_MS));
 
@@ -357,7 +382,7 @@ export class LspManager {
           try {
             const client = new LspClient({
               command: config.command,
-              args: config.args,
+              args: effectiveArgs,
               rootDir: this.rootDir,
               languageId,
               socketPath: daemonSocket,
@@ -367,6 +392,7 @@ export class LspManager {
             this.clients.set(languageId, client);
             this.startingServers.delete(languageId);
             this._callbacks.onServerReady?.(languageId);
+            this.triggerPostInit(languageId, client);
             return client;
           } catch (err: any) {
             lastErr = err;
@@ -386,10 +412,10 @@ export class LspManager {
       }
     }
 
-    // Direct mode (no workspace root, or daemon failed)
+    // Direct mode (no state directory for daemon, or daemon failed)
     const client = new LspClient({
       command: config.command,
-      args: config.args,
+      args: effectiveArgs,
       rootDir: this.rootDir,
       languageId,
       env: config.env,
@@ -402,6 +428,7 @@ export class LspManager {
       this.clients.set(languageId, client);
       this.startingServers.delete(languageId);
       this._callbacks.onServerReady?.(languageId);
+      this.triggerPostInit(languageId, client);
       return client;
     } catch (err: any) {
       this.startingServers.delete(languageId);
@@ -411,18 +438,33 @@ export class LspManager {
     }
   }
 
+  /**
+   * Post-initialization hook for language-specific setup.
+   * For Java/jdtls: triggers a workspace build so diagnostics refresh
+   * after Lombok annotation processing completes.
+   */
+  private triggerPostInit(languageId: string, client: LspClient): void {
+    if (languageId === "java") {
+      // java/buildWorkspace forces jdtls to rebuild and re-publish diagnostics.
+      // The boolean parameter means "full build" (true) vs incremental (false).
+      client.sendRequest("java/buildWorkspace", true).catch(() => {
+        // Not critical — diagnostics will just be stale until a file changes
+      });
+    }
+  }
+
   /** Get the socket path for a language's daemon */
   private getSocketPath(languageId: string): string | null {
-    const wsRoot = this._bemol.workspaceRoot;
-    if (!wsRoot) return null;
-    return join(wsRoot, ".bemol", "sockets", `lsp-${languageId}.sock`);
+    const stateDir = this._workspace.stateDir;
+    if (!stateDir) return null;
+    return join(stateDir, "sockets", `lsp-${languageId}.sock`);
   }
 
   /** Check if a daemon is alive for this language */
   private isDaemonAlive(languageId: string): boolean {
-    const wsRoot = this._bemol.workspaceRoot;
-    if (!wsRoot) return false;
-    const pidPath = join(wsRoot, ".bemol", "sockets", `lsp-${languageId}.pid`);
+    const stateDir = this._workspace.stateDir;
+    if (!stateDir) return false;
+    const pidPath = join(stateDir, "sockets", `lsp-${languageId}.pid`);
     try {
       if (!existsSync(pidPath)) return false;
       const pid = parseInt(readFileSync(pidPath, "utf-8").trim(), 10);
@@ -438,6 +480,7 @@ export class LspManager {
   private async spawnDaemon(
     languageId: string,
     config: ServerConfig,
+    effectiveArgs: string[],
     workspaceFolders?: { uri: string; name: string }[],
     initializationOptions?: Record<string, unknown>,
   ): Promise<void> {
@@ -474,7 +517,7 @@ export class LspManager {
 
     const child = spawnChild(
       process.execPath, // node
-      [launcherScript, jitiPath, daemonScript, socketPath, config.command, ...config.args],
+      [launcherScript, jitiPath, daemonScript, socketPath, config.command, ...effectiveArgs],
       {
         cwd: this.rootDir,
         env,
@@ -511,7 +554,7 @@ export class LspManager {
 
   /** Shut down all clients (disconnect from daemons, kill direct servers) */
   async shutdownAll(): Promise<void> {
-    this._bemol.shutdown();
+    this._workspace.shutdown();
     const shutdowns = [...this.clients.values()].map((client) =>
       client.shutdown().catch(() => {})
     );
@@ -552,16 +595,16 @@ export class LspManager {
 
   /** Kill a running daemon for a language (if any) */
   private killDaemon(languageId: string): void {
-    const wsRoot = this._bemol.workspaceRoot;
-    if (!wsRoot) return;
-    const pidPath = join(wsRoot, ".bemol", "sockets", `lsp-${languageId}.pid`);
+    const stateDir = this._workspace.stateDir;
+    if (!stateDir) return;
+    const pidPath = join(stateDir, "sockets", `lsp-${languageId}.pid`);
     try {
       if (!existsSync(pidPath)) return;
       const pid = parseInt(readFileSync(pidPath, "utf-8").trim(), 10);
       if (isNaN(pid)) return;
       process.kill(pid, "SIGTERM");
       // Clean up socket and pid files
-      const socketPath = join(wsRoot, ".bemol", "sockets", `lsp-${languageId}.sock`);
+      const socketPath = join(stateDir, "sockets", `lsp-${languageId}.sock`);
       try { unlinkSync(socketPath); } catch {}
       try { unlinkSync(pidPath); } catch {}
     } catch {
