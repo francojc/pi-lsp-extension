@@ -261,6 +261,31 @@ export class LspManager {
   }
 
   /**
+   * Eagerly start LSP servers for the given languages in the background.
+   * Unlike getClientForLanguage (which returns null immediately), this method
+   * is fire-and-forget — intended for session_start auto-start.
+   */
+  startEagerly(languageIds: string[]): void {
+    for (const languageId of languageIds) {
+      // Skip if already running or starting
+      const existing = this.clients.get(languageId);
+      if (existing && existing.initialized && !existing.disposed) continue;
+      if (this.startingServers.has(languageId)) continue;
+
+      const config = this.serverConfigs.get(languageId);
+      if (!config) continue;
+
+      const startPromise = this.startServer(languageId, config);
+      this.startingServers.set(languageId, startPromise);
+
+      startPromise.catch((err) => {
+        this.startingServers.delete(languageId);
+        this._callbacks.onServerError?.(languageId, `Auto-start failed: ${err.message}`);
+      });
+    }
+  }
+
+  /**
    * Ensure bemol config is available (one-time per session).
    * Deduplicates concurrent calls. Uses workspace lock to prevent
    * multiple sessions from running bemol simultaneously.

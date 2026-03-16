@@ -40,7 +40,43 @@ import { createCodeSearchTool } from "./tools/code-search.js";
 import { createCodeRewriteTool } from "./tools/code-rewrite.js";
 import { syntheticDotLocks } from "./tools/completions.js";
 import { relative } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { DIAGNOSTIC_SETTLE_DELAY_MS } from "./shared/timing.js";
+
+/**
+ * Project-level LSP config — loaded from `.pi-lsp.json` in the workspace root.
+ *
+ * Example:
+ * ```json
+ * {
+ *   "autoStart": ["java", "typescript"],
+ *   "servers": {
+ *     "python": { "command": "pylsp", "args": [] }
+ *   }
+ * }
+ * ```
+ */
+interface ProjectLspConfig {
+  /** Languages to start eagerly on session_start (e.g. ["java", "typescript"]) */
+  autoStart?: string[];
+  /** Custom server configs keyed by language ID */
+  servers?: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>;
+}
+
+/** Load .pi-lsp.json from a directory. Returns null if not found or invalid. */
+function loadProjectConfig(dir: string): ProjectLspConfig | null {
+  const configPath = join(dir, ".pi-lsp.json");
+  try {
+    if (!existsSync(configPath)) return null;
+    const raw = readFileSync(configPath, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    return parsed as ProjectLspConfig;
+  } catch {
+    return null;
+  }
+}
 
 export default function lspExtension(pi: ExtensionAPI) {
   let manager: LspManager | null = null;
@@ -153,6 +189,28 @@ export default function lspExtension(pi: ExtensionAPI) {
       ctx.ui.setStatus("lsp", ctx.ui.theme.fg("accent", status));
     } else {
       ctx.ui.setStatus("lsp", ctx.ui.theme.fg("dim", "LSP: idle"));
+    }
+
+    // Load project config and apply settings
+    const projectConfig = loadProjectConfig(ctx.cwd);
+    if (projectConfig) {
+      // Apply custom server configs
+      if (projectConfig.servers) {
+        for (const [lang, serverConf] of Object.entries(projectConfig.servers)) {
+          manager.setServerConfig(lang, {
+            command: serverConf.command,
+            args: serverConf.args ?? [],
+            env: serverConf.env,
+          });
+        }
+      }
+
+      // Auto-start configured languages in the background
+      if (projectConfig.autoStart && projectConfig.autoStart.length > 0) {
+        const langs = projectConfig.autoStart;
+        ctx.ui.setStatus("lsp", ctx.ui.theme.fg("warning", `LSP: auto-starting ${langs.join(", ")}...`));
+        manager.startEagerly(langs);
+      }
     }
   });
 

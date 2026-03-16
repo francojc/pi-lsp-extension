@@ -12,8 +12,12 @@ A [pi](https://github.com/mariozechner/pi-mono) coding agent extension that inte
 | `lsp_references` | Find all references to a symbol |
 | `lsp_symbols` | List file symbols or search workspace symbols |
 | `lsp_rename` | Preview rename refactoring (returns planned edits) |
+| `lsp_completions` | Code completion suggestions at a position |
+| `code_overview` | Project structure, key files, and symbols (tree-sitter) |
+| `code_search` | Find code by AST structure with metavariables |
+| `code_rewrite` | Transform code matching structural patterns |
 
-LSP servers start lazily — they only spin up when a tool is first used on a file of that language.
+LSP servers start lazily — they only spin up when a tool is first used on a file of that language. For slow servers (e.g. jdtls), you can [auto-start them on session launch](#project-config).
 
 ## Auto-diagnostics
 
@@ -75,7 +79,7 @@ Add more at runtime:
 
 ## How it Works
 
-1. **Lazy startup** — servers start on first tool use for a file type
+1. **Lazy startup** — servers start on first tool use for a file type (or eagerly via [`.pi-lsp.json`](#project-config))
 2. **File sync** — pi's `read`/`write`/`edit` operations are automatically synced to the LSP via `didOpen`/`didChange`
 3. **Diagnostics cache** — the server pushes diagnostics asynchronously; tools read from a local cache
 4. **Auto-diagnostics** — errors are appended to write/edit results when a server is running
@@ -100,11 +104,40 @@ If your Java project uses [Lombok](https://projectlombok.org/), jdtls needs the 
 
 Run `/lsp-lombok` with no arguments to see which jar is currently configured.
 
+## Project Config
+
+Create a `.pi-lsp.json` file in your project root to configure LSP behavior per-project:
+
+```json
+{
+  "autoStart": ["java", "typescript"],
+  "servers": {
+    "python": { "command": "pylsp", "args": [] }
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `autoStart` | Array of language IDs to start eagerly on session launch. Servers begin initializing in the background immediately — no need to wait for the first tool call. Ideal for slow servers like `jdtls`. |
+| `servers` | Custom server configs keyed by language ID. Overrides the built-in defaults. Each entry has `command`, optional `args` (string array), and optional `env` (key-value pairs). |
+
+The config file is loaded once at session start. Changes require restarting the pi session.
+
+**Example for a Java Brazil workspace:**
+```json
+{
+  "autoStart": ["java"]
+}
+```
+
+This triggers bemol + jdtls startup as soon as the session begins, so by the time you need `lsp_diagnostics` or `lsp_hover`, the server is already warm.
+
 ## Architecture
 
 ```
 src/
-├── index.ts              # Extension entry point
+├── index.ts              # Extension entry point, .pi-lsp.json config loader
 ├── lsp-client.ts         # JSON-RPC client (stdio + socket modes)
 ├── lsp-manager.ts        # Server lifecycle, per-language instances
 ├── file-sync.ts          # didOpen/didChange tracking
@@ -112,13 +145,30 @@ src/
 ├── lsp-daemon-launcher.cjs
 ├── bemol.ts              # Brazil workspace support
 ├── locks.ts              # File-based locking for daemon coordination
+├── resolve-provider.ts   # LSP vs tree-sitter provider selection
+├── shared/
+│   ├── constants.ts      # Skip dirs, file size limits
+│   ├── format.ts         # Location formatting utilities
+│   ├── language-map.ts   # File extension → language ID mapping
+│   └── timing.ts         # Timing constants
+├── tree-sitter/
+│   ├── parser-manager.ts # WASM parser loading and caching
+│   ├── pattern-compiler.ts # Metavariable pattern → AST matcher
+│   ├── search-engine.ts  # Structural search over files
+│   ├── rewrite-engine.ts # Structural find-and-replace
+│   ├── symbol-extractor.ts # Per-language symbol extraction
+│   └── workspace-index.ts # Project-wide symbol index
 └── tools/
     ├── diagnostics.ts
     ├── hover.ts
     ├── definition.ts
     ├── references.ts
     ├── symbols.ts
-    └── rename.ts
+    ├── rename.ts
+    ├── completions.ts
+    ├── code-overview.ts
+    ├── code-search.ts
+    └── code-rewrite.ts
 ```
 
 ## Tips
