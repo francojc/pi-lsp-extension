@@ -209,14 +209,30 @@ export class LspClient {
     const stdin = this.process.stdin!;
     const originalWrite = stdin.write;
     stdin.write = function (this: typeof stdin, ...args: any[]): boolean {
-      if (this.destroyed) {
+      if (this.destroyed || this.writableEnded || this.writableFinished) {
         // Call the callback (last arg) so the Promise resolves instead of rejecting
         const cb = args[args.length - 1];
         if (typeof cb === "function") process.nextTick(cb);
         return false;
       }
-      return originalWrite.apply(this, args as any);
+      try {
+        return originalWrite.apply(this, args as any);
+      } catch (err: any) {
+        // Catch EPIPE synchronously — process exited between our check and the write
+        if (err?.code === "EPIPE" || err?.code === "ERR_STREAM_DESTROYED") {
+          const cb = args[args.length - 1];
+          if (typeof cb === "function") process.nextTick(cb);
+          return false;
+        }
+        throw err;
+      }
     } as any;
+
+    // Catch EPIPE on the stdin stream itself to prevent unhandled error events
+    stdin.on("error", (err: any) => {
+      if (err?.code === "EPIPE") return; // expected when server exits
+      console.error(`[LSP ${this.languageId}] stdin error: ${err.message}`);
+    });
 
     this.process.on("error", (err) => {
       console.error(`[LSP ${this.languageId}] Process error: ${err.message}`);
