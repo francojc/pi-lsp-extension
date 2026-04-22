@@ -40,6 +40,14 @@ export const EXT_TO_LANGUAGE: Record<string, string> = {
   ".html": "html",
   ".htm": "html",
   ".css": "css",
+  ".r": "r",
+  ".R": "r",
+  ".nix": "nix",
+  ".yaml": "yaml",
+  ".yml": "yaml",
+  ".typ": "typst",
+  ".md": "markdown",
+  ".mdx": "markdown",
 };
 
 /** Get the language ID for a file path based on extension */

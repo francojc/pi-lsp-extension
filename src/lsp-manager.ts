@@ -31,14 +31,20 @@ export interface LspManagerCallbacks {
 
 /** Default server configurations for common languages */
 const DEFAULT_SERVERS: Record<string, ServerConfig> = {
-  typescript: { command: "typescript-language-server", args: ["--stdio"] },
-  javascript: { command: "typescript-language-server", args: ["--stdio"] },
-  typescriptreact: { command: "typescript-language-server", args: ["--stdio"] },
-  javascriptreact: { command: "typescript-language-server", args: ["--stdio"] },
-  rust: { command: "rust-analyzer", args: [] },
-  python: { command: "pyright-langserver", args: ["--stdio"] },
+  bash: { command: "bash-language-server", args: ["start"] },
   go: { command: "gopls", args: ["serve"] },
-  java: { command: "jdtls", args: [] },
+  javascript: { command: "typescript-language-server", args: ["--stdio"] },
+  javascriptreact: { command: "typescript-language-server", args: ["--stdio"] },
+  lua: { command: "lua-language-server", args: [] },
+  markdown: { command: "marksman", args: ["server"] },
+  r: { command: "R", args: ["--no-save", "--slave", "-e", "languageserver::run()"] },
+  nix: { command: "nixd", args: [] },
+  python: { command: "pyright-langserver", args: ["--stdio"] },
+  rust: { command: "rust-analyzer", args: [] },
+  typescript: { command: "typescript-language-server", args: ["--stdio"] },
+  typescriptreact: { command: "typescript-language-server", args: ["--stdio"] },
+  typst: { command: "tinymist", args: [] },
+  yaml: { command: "yaml-language-server", args: ["--stdio"] },
 };
 
 // File extension → language ID mapping is in shared/language-map.ts
