@@ -38,6 +38,7 @@ const DEFAULT_SERVERS: Record<string, ServerConfig> = {
   lua: { command: "lua-language-server", args: [] },
   markdown: { command: "marksman", args: ["server"] },
   r: { command: "R", args: ["--no-save", "--slave", "-e", "languageserver::run()"] },
+  json: { command: "vscode-json-languageserver", args: ["--stdio"] },
   nix: { command: "nixd", args: [] },
   python: { command: "pyright-langserver", args: ["--stdio"] },
   rust: { command: "rust-analyzer", args: [] },
