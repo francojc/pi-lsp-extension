@@ -15,6 +15,8 @@ import type {
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { LspManager } from "../lsp-manager.js";
+import type { TreeSitterManager } from "../tree-sitter/parser-manager.js";
+import { resolveSymbolPosition } from "../shared/resolve-position.js";
 import { readFile } from "node:fs/promises";
 import { SYNTHETIC_DOT_SETTLE_DELAY_MS } from "../shared/timing.js";
 
@@ -90,8 +92,9 @@ type CompletionResponse = CompletionList | CompletionItem[] | null;
 
 const CompletionParams = Type.Object({
   path: Type.String({ description: "File path" }),
-  line: Type.Number({ description: "Line number (1-indexed)" }),
-  character: Type.Number({ description: "Column number (1-indexed)" }),
+  line: Type.Optional(Type.Number({ description: "Line number (1-indexed). Required unless query is provided." })),
+  character: Type.Optional(Type.Number({ description: "Column number (1-indexed). Required unless query is provided." })),
+  query: Type.Optional(Type.String({ description: "Symbol name to find in the file. Alternative to line/character — resolves the symbol's position automatically." })),
   limit: Type.Optional(
     Type.Number({ description: "Max results to return (default: 20)" })
   ),
@@ -160,7 +163,8 @@ export const syntheticDotLocks = new Set<string>();
 
 export function createCompletionsTool(
   manager: LspManager,
-  versionTracker?: VersionTracker
+  versionTracker?: VersionTracker,
+  treeSitter?: TreeSitterManager | null,
 ): ToolDefinition<typeof CompletionParams, CompletionDetails> {
   return {
     name: "lsp_completions",
@@ -175,6 +179,25 @@ export function createCompletionsTool(
       const filePath = params.path.replace(/^@/, "");
       const limit = params.limit ?? 20;
       const trigger = params.trigger ?? "auto";
+      let line = params.line;
+      let character = params.character;
+      let resolvedFrom: string | undefined;
+
+      // Resolve position from query if line/character not provided
+      if ((line === undefined || character === undefined) && params.query) {
+        const resolved = await resolveSymbolPosition(filePath, params.query, manager, treeSitter);
+        if (resolved) {
+          line = resolved.line + 1;
+          character = resolved.character + 1;
+          resolvedFrom = `Resolved "${params.query}" → ${resolved.symbolName} at ${line}:${character} [${resolved.source}]`;
+        } else {
+          return { content: [{ type: "text", text: `Could not find symbol "${params.query}" in ${filePath}` }], details: { count: 0, total: 0 } };
+        }
+      }
+
+      if (line === undefined || character === undefined) {
+        return { content: [{ type: "text", text: "Either line/character or query is required." }], details: { count: 0, total: 0 } };
+      }
 
       const client = await manager.getClientForFile(filePath).catch(() => null);
       if (!client) {
@@ -202,8 +225,8 @@ export function createCompletionsTool(
 
       const uri = manager.getFileUri(filePath);
       const position = {
-        line: params.line - 1,
-        character: params.character - 1,
+        line: line - 1,
+        character: character - 1,
       };
 
       try {
@@ -342,7 +365,8 @@ export function createCompletionsTool(
 
         // Format output
         const triggerNote = syntheticDot ? " (synthetic dot trigger)" : "";
-        const header = `${resolvedItems.length} of ${total} completions at ${filePath}:${params.line}:${params.character}${triggerNote}\n`;
+        let header = `${resolvedItems.length} of ${total} completions at ${filePath}:${line}:${character}${triggerNote}\n`;
+        if (resolvedFrom) header = `${resolvedFrom}\n\n${header}`;
         const lines = resolvedItems.map(formatItem);
         const text = header + lines.join("\n");
 
@@ -365,7 +389,12 @@ export function createCompletionsTool(
 
     renderCall(args, theme) {
       let text = theme.fg("toolTitle", theme.bold("lsp_completions "));
-      text += theme.fg("accent", `${args.path}:${args.line}:${args.character}`);
+      if (args.query && !args.line) {
+        text += theme.fg("accent", `${args.path}`);
+        text += theme.fg("muted", ` query="${args.query}"`);
+      } else {
+        text += theme.fg("accent", `${args.path}:${args.line}:${args.character}`);
+      }
       const extras: string[] = [];
       if (args.limit) extras.push(`limit: ${args.limit}`);
       if (args.trigger === "none") extras.push("trigger: none");

@@ -10,6 +10,7 @@ import type { LspManager } from "../lsp-manager.js";
 import type { TreeSitterManager } from "../tree-sitter/parser-manager.js";
 import { resolveProvider } from "../resolve-provider.js";
 import { getEnclosingDeclaration, getSignatureText } from "../tree-sitter/symbol-extractor.js";
+import { resolveSymbolPosition, getSymbolNames } from "../shared/resolve-position.js";
 import { readFile } from "node:fs/promises";
 
 function formatHoverContent(hover: Hover): string {
@@ -31,8 +32,9 @@ function formatHoverContent(hover: Hover): string {
 
 const HoverParams = Type.Object({
   path: Type.String({ description: "File path" }),
-  line: Type.Number({ description: "Line number (1-indexed)" }),
-  character: Type.Number({ description: "Column number (1-indexed)" }),
+  line: Type.Optional(Type.Number({ description: "Line number (1-indexed). Required unless query is provided." })),
+  character: Type.Optional(Type.Number({ description: "Column number (1-indexed). Required unless query is provided." })),
+  query: Type.Optional(Type.String({ description: "Symbol name to find in the file. Alternative to line/character — resolves the symbol's position automatically." })),
 });
 
 interface HoverDetails { hasResult: boolean }
@@ -50,21 +52,48 @@ export function createHoverTool(
 
     async execute(_toolCallId, params) {
       const filePath = params.path.replace(/^@/, "");
+      let line = params.line;
+      let character = params.character;
+      let resolvedFrom: string | undefined;
+
+      // Resolve position from query if line/character not provided
+      if ((line === undefined || character === undefined) && params.query) {
+        const resolved = await resolveSymbolPosition(filePath, params.query, manager, treeSitter);
+        if (resolved) {
+          line = resolved.line;
+          character = resolved.character;
+          resolvedFrom = `Resolved "${params.query}" → ${resolved.symbolName} at ${line}:${character} [${resolved.source}]`;
+        } else {
+          const names = await getSymbolNames(filePath, manager, treeSitter);
+          const hint = names.length > 0 ? `\nAvailable symbols: ${names.slice(0, 20).join(", ")}` : "";
+          return { content: [{ type: "text", text: `Could not find symbol "${params.query}" in ${filePath}${hint}` }], details: { hasResult: false } };
+        }
+      }
+
+      if (line === undefined || character === undefined) {
+        return { content: [{ type: "text", text: "Either line/character or query is required." }], details: { hasResult: false } };
+      }
+
       const client = await manager.getClientForFile(filePath).catch(() => null);
 
       if (client) {
         // LSP path
         const uri = manager.getFileUri(filePath);
-        const position = { line: params.line - 1, character: params.character - 1 };
+        const position = { line: line - 1, character: character - 1 };
 
         try {
           const hover = await client.sendRequest<Hover | null>("textDocument/hover", {
             textDocument: { uri }, position,
           });
           if (!hover) {
-            return { content: [{ type: "text", text: "No hover information available at this position." }], details: { hasResult: false } };
+            const text = resolvedFrom
+              ? `${resolvedFrom}\n\nNo hover information available at this position.`
+              : "No hover information available at this position.";
+            return { content: [{ type: "text", text }], details: { hasResult: false } };
           }
-          return { content: [{ type: "text", text: formatHoverContent(hover) }], details: { hasResult: true } };
+          const hoverText = formatHoverContent(hover);
+          const text = resolvedFrom ? `${resolvedFrom}\n\n${hoverText}` : hoverText;
+          return { content: [{ type: "text", text }], details: { hasResult: true } };
         } catch (err: any) {
           return { content: [{ type: "text", text: `LSP hover request failed: ${err.message}` }], details: { hasResult: false } };
         }
@@ -79,14 +108,18 @@ export function createHoverTool(
             const content = await readFile(absPath, "utf-8");
             const tree = await treeSitter.parse(absPath, content);
             if (tree) {
-              const decl = getEnclosingDeclaration(tree, params.line - 1, params.character - 1);
+              const decl = getEnclosingDeclaration(tree, line - 1, character - 1);
               if (decl) {
                 const sig = getSignatureText(decl);
                 const kindLabel = decl.type.replace(/_/g, " ");
-                const text = `${kindLabel} [tree-sitter]\n\n\`\`\`\n${sig}\n\`\`\``;
+                let text = `${kindLabel} [tree-sitter]\n\n\`\`\`\n${sig}\n\`\`\``;
+                if (resolvedFrom) text = `${resolvedFrom}\n\n${text}`;
                 return { content: [{ type: "text", text }], details: { hasResult: true } };
               }
-              return { content: [{ type: "text", text: "No hover information available at this position. [tree-sitter]" }], details: { hasResult: false } };
+              const text = resolvedFrom
+                ? `${resolvedFrom}\n\nNo hover information available at this position. [tree-sitter]`
+                : "No hover information available at this position. [tree-sitter]";
+              return { content: [{ type: "text", text }], details: { hasResult: false } };
             }
           } catch { /* fall through */ }
         }
@@ -97,7 +130,12 @@ export function createHoverTool(
 
     renderCall(args, theme) {
       let text = theme.fg("toolTitle", theme.bold("lsp_hover "));
-      text += theme.fg("accent", `${args.path}:${args.line}:${args.character}`);
+      if (args.query && !args.line) {
+        text += theme.fg("accent", `${args.path}`);
+        text += theme.fg("muted", ` query="${args.query}"`);
+      } else {
+        text += theme.fg("accent", `${args.path}:${args.line}:${args.character}`);
+      }
       return new Text(text, 0, 0);
     },
 

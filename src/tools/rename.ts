@@ -9,6 +9,8 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { truncateHead, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { LspManager } from "../lsp-manager.js";
+import type { TreeSitterManager } from "../tree-sitter/parser-manager.js";
+import { resolveSymbolPosition, getSymbolNames } from "../shared/resolve-position.js";
 import { fileURLToPath } from "node:url";
 import { relative } from "node:path";
 
@@ -53,14 +55,18 @@ function formatWorkspaceEdit(edit: WorkspaceEdit, rootDir: string): { summary: s
 
 const RenameParams = Type.Object({
   path: Type.String({ description: "File path" }),
-  line: Type.Number({ description: "Line number (1-indexed)" }),
-  character: Type.Number({ description: "Column number (1-indexed)" }),
+  line: Type.Optional(Type.Number({ description: "Line number (1-indexed). Required unless query is provided." })),
+  character: Type.Optional(Type.Number({ description: "Column number (1-indexed). Required unless query is provided." })),
+  query: Type.Optional(Type.String({ description: "Symbol name to find in the file. Alternative to line/character — resolves the symbol's position automatically." })),
   newName: Type.String({ description: "New name for the symbol" }),
 });
 
 interface RenameDetails { fileCount: number; editCount: number }
 
-export function createRenameTool(manager: LspManager): ToolDefinition<typeof RenameParams, RenameDetails> {
+export function createRenameTool(
+  manager: LspManager,
+  treeSitter?: TreeSitterManager | null,
+): ToolDefinition<typeof RenameParams, RenameDetails> {
   return {
     name: "lsp_rename",
     label: "LSP Rename",
@@ -70,13 +76,35 @@ export function createRenameTool(manager: LspManager): ToolDefinition<typeof Ren
 
     async execute(_toolCallId, params) {
       const filePath = params.path.replace(/^@/, "");
+      let line = params.line;
+      let character = params.character;
+      let resolvedFrom: string | undefined;
+
+      // Resolve position from query if line/character not provided
+      if ((line === undefined || character === undefined) && params.query) {
+        const resolved = await resolveSymbolPosition(filePath, params.query, manager, treeSitter);
+        if (resolved) {
+          line = resolved.line;
+          character = resolved.character;
+          resolvedFrom = `Resolved "${params.query}" → ${resolved.symbolName} at ${line}:${character} [${resolved.source}]`;
+        } else {
+          const names = await getSymbolNames(filePath, manager, treeSitter);
+          const hint = names.length > 0 ? `\nAvailable symbols: ${names.slice(0, 20).join(", ")}` : "";
+          return { content: [{ type: "text", text: `Could not find symbol "${params.query}" in ${filePath}${hint}` }], details: { fileCount: 0, editCount: 0 } };
+        }
+      }
+
+      if (line === undefined || character === undefined) {
+        return { content: [{ type: "text", text: "Either line/character or query is required." }], details: { fileCount: 0, editCount: 0 } };
+      }
+
       const client = await manager.getClientForFile(filePath).catch(() => null);
       if (!client) {
         return { content: [{ type: "text", text: manager.getUnavailableReason(filePath) }], details: { fileCount: 0, editCount: 0 } };
       }
 
       const uri = manager.getFileUri(filePath);
-      const position = { line: params.line - 1, character: params.character - 1 };
+      const position = { line: line - 1, character: character - 1 };
 
       try {
         const result = await client.sendRequest<WorkspaceEdit | null>("textDocument/rename", {
@@ -84,18 +112,22 @@ export function createRenameTool(manager: LspManager): ToolDefinition<typeof Ren
         });
 
         if (!result) {
-          return { content: [{ type: "text", text: "Rename not possible at this position." }], details: { fileCount: 0, editCount: 0 } };
+          const text = resolvedFrom ? `${resolvedFrom}\n\nRename not possible at this position.` : "Rename not possible at this position.";
+          return { content: [{ type: "text", text }], details: { fileCount: 0, editCount: 0 } };
         }
 
         const rootDir = manager.resolvePath(".");
         const { summary, fileCount, editCount } = formatWorkspaceEdit(result, rootDir);
 
         if (editCount === 0) {
-          return { content: [{ type: "text", text: "No edits needed for this rename." }], details: { fileCount: 0, editCount: 0 } };
+          const text = resolvedFrom ? `${resolvedFrom}\n\nNo edits needed for this rename.` : "No edits needed for this rename.";
+          return { content: [{ type: "text", text }], details: { fileCount: 0, editCount: 0 } };
         }
 
         const truncation = truncateHead(summary, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-        let text = `Rename "${params.newName}": ${editCount} edit(s) across ${fileCount} file(s)\n\n`;
+        let text = "";
+        if (resolvedFrom) text += `${resolvedFrom}\n\n`;
+        text += `Rename "${params.newName}": ${editCount} edit(s) across ${fileCount} file(s)\n\n`;
         text += "NOTE: These changes are NOT applied. Use edit/write tools to make the changes.\n\n";
         text += truncation.content;
         if (truncation.truncated) text += `\n\n[Truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines]`;
@@ -108,8 +140,13 @@ export function createRenameTool(manager: LspManager): ToolDefinition<typeof Ren
 
     renderCall(args, theme) {
       let text = theme.fg("toolTitle", theme.bold("lsp_rename "));
-      text += theme.fg("accent", `${args.path}:${args.line}:${args.character}`);
-      text += theme.fg("muted", ` → ${args.newName}`);
+      if (args.query && !args.line) {
+        text += theme.fg("accent", `${args.path}`);
+        text += theme.fg("muted", ` query="${args.query}" → ${args.newName}`);
+      } else {
+        text += theme.fg("accent", `${args.path}:${args.line}:${args.character}`);
+        text += theme.fg("muted", ` → ${args.newName}`);
+      }
       return new Text(text, 0, 0);
     },
 

@@ -12,6 +12,7 @@ import type { WorkspaceIndex } from "../tree-sitter/workspace-index.js";
 import { resolveProvider } from "../resolve-provider.js";
 import { getNodeAtPosition, findDefinition } from "../tree-sitter/symbol-extractor.js";
 import { formatLocation, formatLocationLink } from "../shared/format.js";
+import { resolveSymbolPosition, getSymbolNames } from "../shared/resolve-position.js";
 import { readFile } from "node:fs/promises";
 import { relative } from "node:path";
 
@@ -19,8 +20,9 @@ type DefinitionResult = Location | Location[] | LocationLink[] | null;
 
 const DefinitionParams = Type.Object({
   path: Type.String({ description: "File path" }),
-  line: Type.Number({ description: "Line number (1-indexed)" }),
-  character: Type.Number({ description: "Column number (1-indexed)" }),
+  line: Type.Optional(Type.Number({ description: "Line number (1-indexed). Required unless query is provided." })),
+  character: Type.Optional(Type.Number({ description: "Column number (1-indexed). Required unless query is provided." })),
+  query: Type.Optional(Type.String({ description: "Symbol name to find in the file. Alternative to line/character — resolves the symbol's position automatically." })),
 });
 
 interface DefinitionDetails { count: number }
@@ -39,25 +41,53 @@ export function createDefinitionTool(
 
     async execute(_toolCallId, params) {
       const filePath = params.path.replace(/^@/, "");
+      let line = params.line;
+      let character = params.character;
+      let resolvedFrom: string | undefined;
+
+      // Resolve position from query if line/character not provided
+      if ((line === undefined || character === undefined) && params.query) {
+        const resolved = await resolveSymbolPosition(filePath, params.query, manager, treeSitter);
+        if (resolved) {
+          line = resolved.line;
+          character = resolved.character;
+          resolvedFrom = `Resolved "${params.query}" → ${resolved.symbolName} at ${line}:${character} [${resolved.source}]`;
+        } else {
+          const names = await getSymbolNames(filePath, manager, treeSitter);
+          const hint = names.length > 0 ? `\nAvailable symbols: ${names.slice(0, 20).join(", ")}` : "";
+          return { content: [{ type: "text", text: `Could not find symbol "${params.query}" in ${filePath}${hint}` }], details: { count: 0 } };
+        }
+      }
+
+      if (line === undefined || character === undefined) {
+        return { content: [{ type: "text", text: "Either line/character or query is required." }], details: { count: 0 } };
+      }
+
       const client = await manager.getClientForFile(filePath).catch(() => null);
 
       if (client) {
         // LSP path
         const uri = manager.getFileUri(filePath);
-        const position = { line: params.line - 1, character: params.character - 1 };
+        const position = { line: line - 1, character: character - 1 };
 
         try {
           const result = await client.sendRequest<DefinitionResult>("textDocument/definition", {
             textDocument: { uri }, position,
           });
 
-          if (!result) return { content: [{ type: "text", text: "No definition found." }], details: { count: 0 } };
+          if (!result) {
+            const text = resolvedFrom ? `${resolvedFrom}\n\nNo definition found.` : "No definition found.";
+            return { content: [{ type: "text", text }], details: { count: 0 } };
+          }
 
           const rootDir = manager.resolvePath(".");
           let locations: string[];
 
           if (Array.isArray(result)) {
-            if (result.length === 0) return { content: [{ type: "text", text: "No definition found." }], details: { count: 0 } };
+            if (result.length === 0) {
+              const text = resolvedFrom ? `${resolvedFrom}\n\nNo definition found.` : "No definition found.";
+              return { content: [{ type: "text", text }], details: { count: 0 } };
+            }
             if ("targetUri" in result[0]) {
               locations = (result as LocationLink[]).map((l) => formatLocationLink(l, rootDir));
             } else {
@@ -67,9 +97,10 @@ export function createDefinitionTool(
             locations = [formatLocation(result as Location, rootDir)];
           }
 
-          const text = locations.length === 1
+          let text = locations.length === 1
             ? `Definition: ${locations[0]}`
             : `Definitions:\n${locations.map((l) => `  ${l}`).join("\n")}`;
+          if (resolvedFrom) text = `${resolvedFrom}\n\n${text}`;
 
           return { content: [{ type: "text", text }], details: { count: locations.length } };
         } catch (err: any) {
@@ -87,7 +118,7 @@ export function createDefinitionTool(
             const tree = await treeSitter.parse(absPath, content);
             if (tree) {
               // Get the symbol name at the cursor position
-              const node = getNodeAtPosition(tree, params.line - 1, params.character - 1);
+              const node = getNodeAtPosition(tree, line - 1, character - 1);
               if (node) {
                 const symbolName = node.text;
                 const rootDir = manager.resolvePath(".");
@@ -96,32 +127,36 @@ export function createDefinitionTool(
                 // Search current file first
                 const localDefs = findDefinition(tree, symbolName, provider.languageId);
                 if (localDefs.length > 0) {
-                  const locations = localDefs.map((d) => `${relPath}:${d.line}:1`);
-                  const text = locations.length === 1
-                    ? `Definition [tree-sitter]: ${locations[0]}`
-                    : `Definitions [tree-sitter]:\n${locations.map((l) => `  ${l}`).join("\n")}`;
-                  return { content: [{ type: "text", text }], details: { count: locations.length } };
+                  const locs = localDefs.map((d) => `${relPath}:${d.line}:1`);
+                  let text = locs.length === 1
+                    ? `Definition [tree-sitter]: ${locs[0]}`
+                    : `Definitions [tree-sitter]:\n${locs.map((l) => `  ${l}`).join("\n")}`;
+                  if (resolvedFrom) text = `${resolvedFrom}\n\n${text}`;
+                  return { content: [{ type: "text", text }], details: { count: locs.length } };
                 }
 
                 // Search workspace index
                 if (workspaceIndex) {
                   await workspaceIndex.build();
                   const entries = workspaceIndex.search(symbolName);
-                  // Filter to exact name matches for definitions
                   const exact = entries.filter((e) => e.name === symbolName);
                   if (exact.length > 0) {
-                    const locations = exact.slice(0, 10).map((e) => {
-                      const rel = relative(rootDir, e.file);
+                    const rootDir2 = manager.resolvePath(".");
+                    const locs = exact.slice(0, 10).map((e) => {
+                      const rel = relative(rootDir2, e.file);
                       return `${rel}:${e.line}:1`;
                     });
-                    const text = locations.length === 1
-                      ? `Definition [tree-sitter]: ${locations[0]}`
-                      : `Definitions [tree-sitter]:\n${locations.map((l) => `  ${l}`).join("\n")}`;
-                    return { content: [{ type: "text", text }], details: { count: locations.length } };
+                    let text = locs.length === 1
+                      ? `Definition [tree-sitter]: ${locs[0]}`
+                      : `Definitions [tree-sitter]:\n${locs.map((l) => `  ${l}`).join("\n")}`;
+                    if (resolvedFrom) text = `${resolvedFrom}\n\n${text}`;
+                    return { content: [{ type: "text", text }], details: { count: locs.length } };
                   }
                 }
 
-                return { content: [{ type: "text", text: `No definition found for "${symbolName}" [tree-sitter]` }], details: { count: 0 } };
+                const msg = `No definition found for "${symbolName}" [tree-sitter]`;
+                const text = resolvedFrom ? `${resolvedFrom}\n\n${msg}` : msg;
+                return { content: [{ type: "text", text }], details: { count: 0 } };
               }
             }
           } catch { /* fall through */ }
@@ -133,7 +168,12 @@ export function createDefinitionTool(
 
     renderCall(args, theme) {
       let text = theme.fg("toolTitle", theme.bold("lsp_definition "));
-      text += theme.fg("accent", `${args.path}:${args.line}:${args.character}`);
+      if (args.query && !args.line) {
+        text += theme.fg("accent", `${args.path}`);
+        text += theme.fg("muted", ` query="${args.query}"`);
+      } else {
+        text += theme.fg("accent", `${args.path}:${args.line}:${args.character}`);
+      }
       return new Text(text, 0, 0);
     },
 

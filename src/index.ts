@@ -39,6 +39,7 @@ import { createCodeOverviewTool } from "./tools/code-overview.js";
 import { createCompletionsTool } from "./tools/completions.js";
 import { createCodeSearchTool } from "./tools/code-search.js";
 import { createCodeRewriteTool } from "./tools/code-rewrite.js";
+import { createCodeActionsTool } from "./tools/code-actions.js";
 import { syntheticDotLocks } from "./tools/completions.js";
 import { relative } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
@@ -299,14 +300,15 @@ export default function lspExtension(pi: ExtensionAPI) {
   pi.registerTool(createDiagnosticsTool(managerProxy, treeSitterProxy));
   pi.registerTool(createHoverTool(managerProxy, treeSitterProxy));
   pi.registerTool(createDefinitionTool(managerProxy, treeSitterProxy, workspaceIndexProxy));
-  pi.registerTool(createReferencesTool(managerProxy));
+  pi.registerTool(createReferencesTool(managerProxy, treeSitterProxy));
   pi.registerTool(createSymbolsTool(managerProxy, treeSitterProxy, workspaceIndexProxy));
-  pi.registerTool(createRenameTool(managerProxy));
+  pi.registerTool(createRenameTool(managerProxy, treeSitterProxy));
+  pi.registerTool(createCodeActionsTool(managerProxy, treeSitterProxy));
   pi.registerTool(createCompletionsTool(managerProxy, {
     getTrackedVersion: (uri) => getFileSync().getTrackedVersion(uri),
     setTrackedVersion: (uri, v) => getFileSync().setTrackedVersion(uri, v),
     isSyntheticDotActive: (uri) => syntheticDotLocks.has(uri),
-  }));
+  }, treeSitterProxy));
   const getRootDir = () => manager?.resolvePath(".") ?? process.cwd();
   pi.registerTool(createCodeOverviewTool(getRootDir, treeSitterProxy, workspaceIndexProxy));
   pi.registerTool(createCodeSearchTool(getRootDir, treeSitterProxy));
@@ -315,6 +317,7 @@ export default function lspExtension(pi: ExtensionAPI) {
       getFileSync().handleFileWrite(filePath).catch(() => {});
     },
   }));
+  pi.registerTool(createCodeActionsTool(managerProxy, treeSitterProxy));
 
   // File sync: track file reads/writes/edits
   // After writes/edits, append file-scoped error diagnostics to the tool result
